@@ -1,0 +1,775 @@
+# predictive-maintenance — Predictive Maintenance
+#
+# Condition sense → failure predict → work order → parts → repair.
+# Rule 1: team — sensor events fan to multiple analyzers; reliability
+# engineer reviews on shutdown / unscheduled work; technician
+# dispatched on routine. maint × goods ROI cell — pool 7% revenue,
+# routine 60%, internal visibility.
+
+name: "predictive-maintenance"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 604800
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    This mesh runs predictive maintenance. A successful turn:
+      - condition_sensor pulls vibration / temp / pressure / current
+      - failure_predictor scores RUL (remaining useful life)
+      - work_order_scheduler picks the window, confirms parts
+        inventory, then routes to technician (humanoid in v2)
+      - reliability_engineer reviews shutdown decisions
+
+    Escalate when:
+      - predicted_failure_hours < 24 OR safety_critical asset
+      - parts_lead_time > predicted_failure_hours
+      - same asset has 3+ unscheduled work orders in 30 days
+
+  routing:
+    mode: "learning"
+    memory_size: 200
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "maintenance_runbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "ops_manager_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{asset_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_MAINT_CHANNEL:}"
+        message_template: "[maint] {{message}} — asset {{asset_id}}"
+
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+data_structures:
+  MaintEvent:
+    type: "object"
+    properties:
+      asset_id: { type: "string" }
+      asset_type: { type: "string" }
+      reading: { type: "object" }
+      received_at_utc: { type: "string" }
+    required: ["asset_id"]
+
+entry_points:
+  - name: "sensor_reading"
+    target: "condition_sensor_agent"
+    description: "IIoT vibration / temp / pressure / current"
+
+  - name: "work_order_filed"
+    target: "work_order_scheduler_agent"
+    description: "Technician/operator-filed work order"
+
+  - name: "scheduled_inspection"
+    target: "condition_sensor_agent"
+    description: "Routine PM inspection (cron-friendly)"
+
+  - name: "parts_arrived"
+    target: "work_order_scheduler_agent"
+    description: "Parts inbound — release work order (re-runs the WO pipeline: schedule → parts → dispatch)"
+
+  - name: "shutdown_request"
+    target: "reliability_engineer_human"
+    description: "Manual shutdown request — straight to engineer"
+
+  - name: "work_order_ingest"
+    target: "maintenance_records_agent"
+    description: "Record one work order (planned, corrective, emergency)"
+
+  - name: "asset_history_query"
+    target: "maintenance_records_agent"
+    description: "Read maintenance history for one or all assets"
+
+  - name: "pm_compliance_report"
+    target: "maintenance_records_agent"
+    description: "PM completion rate report — by asset class (mode: pm_compliance)"
+
+  - name: "weekly_parts_forecast"
+    target: "spare_parts_forecaster_agent"
+    description: "Mon 08:00 — 90-day parts demand forecast for procurement"
+
+  - name: "shutdown_parts_plan"
+    target: "spare_parts_forecaster_agent"
+    description: "Planned shutdown announced — model parts demand for the outage window"
+
+  - name: "emergency_parts_request"
+    target: "spare_parts_forecaster_agent"
+    description: "Equipment failed — urgent same-day parts demand + supplier ETA"
+
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_failure_predictor"
+    target: "failure_predictor_agent"
+    description: "On-demand direct call to failure_predictor (llm) — bypasses upstream chain"
+
+  - name: "direct_call_work_order_scheduler"
+    target: "work_order_scheduler_agent"
+    description: "On-demand direct call to work_order_scheduler (programmatic, schedule → parts → dispatch) — bypasses upstream chain"
+
+  - name: "direct_call_maintenance_records"
+    target: "maintenance_records_agent"
+    description: "On-demand direct call to maintenance_records (programmatic, mode-dispatched: WO ledger / PM compliance / recurrence sweep) — bypasses upstream chain"
+
+  # ── Lyzr-inspired agents (added in 2.3.x) ──
+  - name: "equipment_lifecycle_assess"
+    target: "equipment_lifecycle_agent"
+    description: "Per-asset lifecycle scoring — age vs design life + cost-to-keep vs cost-to-replace → continue/overhaul/replace"
+
+  - name: "safety_incident_report"
+    target: "safety_incident_reporter_agent"
+    description: "Normalises a safety incident → OSHA severity + filing requirements"
+
+
+agents:
+
+  condition_sensor_agent:
+    name: "condition_sensor_agent"
+    agent_type: "programmatic"
+    description: "Reads condition signals for an asset from your plant historian / IoT platform"
+    communication_type: "chain"
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # Sensor data lives in your plant historian / IoT platform, not
+    # in this template. Point this connector at an MCP gateway (or
+    # swap integration to n8n/zapier) that returns the yields below.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${HISTORIAN_MCP_URL:}"      # your historian / IoT gateway (PI, Ignition, ThingWorx, ...)
+      tool_name: "read_condition_signals"    # must return the yields below
+      timeout: 30
+    # wake_up: "0 6 * * *"   # routine PM sweep — enable after wiring your historian connector
+    yields:
+      asset_id: "string"
+      sensor_summary: "object"
+      anomaly_detected: "boolean"
+    inputs:
+      payload: "object"
+    can_call:
+      - agent: "failure_predictor_agent"
+        condition: "calling_agent_response.anomaly_detected == true"
+
+  # ────────────────────────────────────────────────────────────
+  # failure_predictor_agent — self-reliant predictive reliability
+  # analyst. KEEPS A PYTHON MODULE (agency/failure_predictor_agent.py):
+  #   @pre_compose load_condition — pulls its OWN telemetry series +
+  #     asset history + the deterministic failure-probability score
+  #     from the dev store (PROD: historian / CMMS), not spoon-fed.
+  #   @chain enforce_floors — two floors the LLM CANNOT waive:
+  #     (1) failure-probability severity floor: risk score >= 0.7 →
+  #         RUL clamped into the 24h window + safety forced;
+  #     (2) safety-critical hard-stop: safety-critical asset OR
+  #         low-confidence-inside-window → safety forced + engineer.
+  # The wires below fire on the POST-floor values.
+  # ────────────────────────────────────────────────────────────
+  failure_predictor_agent:
+    name: "failure_predictor_agent"
+    agent_type: "llm"
+    description: "Predictive reliability analyst — RUL + failure mode, with deterministic safety floors"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 800
+    communication_type: "chain"
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"asset_id": "", "predicted_failure_hours": 0, "failure_mode": "", "confidence": 0, "safety_critical": false, "failure_prob_24h": 0, "engineer_briefing": ""}
+      ("asset_id" and "failure_prob_24h" are reconciled deterministically
+      by the agent — echo your best values; the module is authoritative.)
+      Predict the remaining useful life (RUL) for this asset using the
+      telemetry series and maintenance history provided in your context.
+      Return JSON with these keys:
+        - "predicted_failure_hours": estimated hours until failure
+          (a number, never negative)
+        - "failure_mode": short tag (bearing_wear, seal_leak, etc.);
+          use "unknown" when the signature is unclear
+        - "confidence": a number between 0 and 1 (never outside)
+        - "safety_critical": true if failure poses injury / fire / leak risk
+        - "engineer_briefing": 3-4 sentence narrative for the reliability
+          engineer. Lead with RUL + failure mode + confidence. Cite the
+          specific sensor signature (vibration peak, temp drift, current
+          spike). Recommend whether to schedule corrective maintenance
+          OR emergency intervention.
+
+      HARD POLICY (also enforced deterministically by the agent's @chain
+      and the mesh wiring — you cannot waive these):
+        - If "predicted_failure_hours" is below 24 AND "confidence" is
+          below 0.7, "safety_critical" is forced true. A low-confidence
+          prediction inside the shutdown window is treated defensively.
+        - If the asset's deterministic failure-probability score is high,
+          the RUL is clamped into the shutdown window regardless of your
+          estimate. Do not be optimistic about a degrading signature.
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "failure_modes"
+
+    yields:
+      asset_id: "string"
+      predicted_failure_hours: "number"
+      failure_mode: "string"
+      confidence: "number"
+      safety_critical: "boolean"
+      failure_prob_24h: "number"
+      engineer_briefing: "string"
+
+    inputs:
+      upstream_yields: "object"
+      asset_id: "string"
+
+    can_call:
+      - agent: "work_order_scheduler_agent"
+
+      # Deterministic safety floor (enforced by @chain enforce_floors AND
+      # this wire): a low-confidence prediction inside the 24h shutdown
+      # window, OR a forced safety_critical flag, loops in the reliability
+      # engineer regardless of the LLM's optimism.
+      - agent: "reliability_engineer_human"
+        condition: "calling_agent_response.safety_critical == true or (calling_agent_response.predicted_failure_hours < 24 and calling_agent_response.confidence < 0.7)"
+
+  # ────────────────────────────────────────────────────────────
+  # work_order_scheduler_agent — full WO pipeline (merged 2.3.x)
+  # Absorbed the former parts-check and dispatch agents: one agent
+  # now runs the strictly sequential WO concern — schedule the
+  # window/type → check parts (lead-time vs RUL gate) → dispatch
+  # the technician.
+  #
+  # KEEPS ITS PYTHON MODULE (YAML-first exception): this is the
+  # ACTUATOR that creates work orders and dispatches a human.
+  #   @pre_compose load_parts — pulls its OWN parts picture (on-hand +
+  #     lead time, resolved from the failure mode) + any open WO on the
+  #     asset from the parts master / CMMS (dev store), not spoon-fed.
+  #   Body: RUL → work-type matrix; parts-availability gate BEFORE
+  #     scheduling (fail-closed, lead-time vs RUL); refuse untraceable WO.
+  #   @chain set_priority — work-order PRIORITY floor: P1 emergency /
+  #     P2 corrective / P3 planned, derived deterministically; an
+  #     emergency / safety job cannot be down-ranked.
+  # ────────────────────────────────────────────────────────────
+  work_order_scheduler_agent:
+    name: "work_order_scheduler_agent"
+    agent_type: "programmatic"
+    description: "Picks the maintenance window + work-order type, confirms parts, dispatches technician"
+    communication_type: "chain"
+    yields:
+      work_order_id: "string"           # identity passthrough — technician_human inputs
+      window_start_utc: "string"
+      work_type: "string"               # planned | corrective | emergency
+      priority: "string"                # P1 | P2 | P3 — set by the @chain priority floor
+      requires_engineer_review: "boolean"
+      parts_available: "boolean"
+      lead_time_hours: "number"
+      parts_short: "list"
+      dispatched_to: "string"
+      dispatched_at_utc: "string"
+      eta_minutes: "number"
+    inputs:
+      predicted_failure_hours: "number"
+      safety_critical: "boolean"
+      work_order_id: "string"
+      failure_mode: "string"
+    narration: |
+      Three sequential stages:
+        1. schedule:
+           - failure < 24h OR safety_critical → emergency + engineer review
+           - failure 24-168h → corrective + standard dispatch
+           - failure > 168h → planned + next PM window
+        2. parts check — parts unavailable / lead time > failure
+           window → engineer review (no dispatch)
+        3. dispatch — technician (or humanoid in v2) when parts ok
+    can_call:
+      - agent: "technician_human"
+        condition: "calling_agent_response.dispatched_to == 'technician'"
+
+      # Lead time > failure window → engineer review
+      - agent: "reliability_engineer_human"
+        condition: "calling_agent_response.parts_available == false"
+
+      # Non-technician dispatch (parts OK) → history ledger.
+      # parts_available guard keeps the parts-short path on the
+      # engineer route only (pre-merge behaviour).
+      - agent: "maint_audit_logger_agent"
+        condition: "calling_agent_response.parts_available == true and calling_agent_response.dispatched_to != 'technician'"
+
+  technician_human:
+    name: "technician_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Maintenance technician — does the repair"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 7200
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_reliability_engineer"
+      message: "escalate_to_reliability_engineer"
+      note: "Technician didn't respond — engineer escalation"
+    yields:
+      decision: "string"               # completed | parts_issue | escalate
+      notes: "string"
+    inputs:
+      work_order_id: "string"
+    can_call:
+      - agent: "reliability_engineer_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_reliability_engineer' or calling_agent_response.human_message == 'escalate'"
+
+      - agent: "maint_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'completed'"
+
+  reliability_engineer_human:
+    name: "reliability_engineer_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Reliability engineer — shutdown / unscheduled work review"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_ops_manager"
+      message: "escalate_to_ops_manager"
+      note: "Reliability engineer didn't respond — ops manager escalation"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      asset_id: "string"
+    can_call:
+      - agent: "ops_manager_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_ops_manager'"
+
+      - agent: "maint_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_ops_manager'"
+
+  ops_manager_human:
+    name: "ops_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Ops manager — production-impact tier"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 21600
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Ops manager unavailable — held"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      asset_id: "string"
+    can_call:
+      - agent: "maint_audit_logger_agent"
+
+  maint_audit_logger_agent:
+    name: "maint_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM audit"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/maint_audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # spare_parts_forecaster_agent — self-reliant parts-demand forecaster.
+  # Real maintenance pain: parts shortages cause unplanned downtime;
+  # parts overstock ties up capital. KEEPS A PYTHON MODULE
+  # (agency/spare_parts_forecaster_agent.py):
+  #   @pre_compose load_demand_signals — pulls its OWN data: the parts
+  #     inventory (on-hand + lead time) AND per-SKU consumption run-rate
+  #     from the dev store (PROD: ERP/MRP master + issues ledger), so it
+  #     forecasts over real usage, not a spoon-fed blob.
+  #   @chain enforce_stockout_floor — any SKU whose days-to-stockout is
+  #     at/below its lead time is FORCED into critical_shortages (a known
+  #     stockout the LLM can't optimistically drop).
+  # The weekly forecast cron stays live (needs no connector).
+  # ────────────────────────────────────────────────────────────
+  spare_parts_forecaster_agent:
+    name: "spare_parts_forecaster_agent"
+    agent_type: "llm"
+    description: "Predicts spare-parts demand from asset RUL trends; feeds procurement"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1200
+    communication_type: "chain"
+    wake_up: "0 8 * * 1"               # Monday 08:00 — weekly forecast refresh
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"parts_needed_30d": [], "parts_needed_60d": [], "parts_needed_90d": [], "critical_shortages": [], "overstock_candidates": [], "executive_summary": "", "confidence_overall": 0}
+      Forecast 90-day spare-parts demand based on RUL trends across
+      the asset fleet. Return JSON:
+        - parts_needed_30d: list of {part_sku, qty, confidence}
+        - parts_needed_60d: list of {part_sku, qty, confidence}
+        - parts_needed_90d: list of {part_sku, qty, confidence}
+        - critical_shortages: list of {part_sku, current_stock,
+          predicted_demand_days, days_to_stockout}
+        - overstock_candidates: list of {part_sku, current_stock,
+          months_of_supply}  (slow-movers tying up capital)
+        - executive_summary: 3-sentence overview for procurement
+        - confidence_overall: a number between 0 and 1 (never outside)
+
+      Be conservative on confidence. A wrong forecast that triggers
+      premature reorders erodes trust with procurement. Every
+      per-part confidence value must also stay between 0 and 1.
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "parts_master"
+
+    yields:
+      parts_needed_30d: "list"
+      parts_needed_60d: "list"
+      parts_needed_90d: "list"
+      critical_shortages: "list"
+      overstock_candidates: "list"
+      executive_summary: "string"
+      confidence_overall: "number"
+
+    inputs:
+      trigger: "string"
+
+    can_call:
+      - agent: "ops_manager_human"
+
+  # ────────────────────────────────────────────────────────────
+  # maintenance_records_agent — maintenance records analyst
+  # (merged 2.3.x: absorbed the former pm-compliance and
+  # recurrence-watchdog responsibilities). One records analyst,
+  # three responsibilities, mode-dispatched in YOUR CMMS:
+  #   1. WO ledger / MTBF — per-asset MTBF, cost, downtime,
+  #      overdue PMs (mode: ingest_wo | schedule_pm | report)
+  #   2. PM-completion tracking — compliance rate vs target by
+  #      asset class (mode: pm_compliance)
+  #   3. Daily recurrence sweep — flags assets with 3+ unscheduled
+  #      WOs in 30d (mode: recurrence_sweep)
+  # ────────────────────────────────────────────────────────────
+  maintenance_records_agent:
+    name: "maintenance_records_agent"
+    agent_type: "programmatic"
+    description: "Maintenance records analyst — WO ledger/MTBF, PM-compliance tracking, daily recurrence sweep"
+    communication_type: "chain"
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # Work orders live in your CMMS, not in this template. Point
+    # this connector at an MCP gateway (or swap integration to
+    # n8n/zapier) that returns the yields below. The gateway
+    # receives `mode` (ingest_wo | schedule_pm | report |
+    # pm_compliance | recurrence_sweep) plus the other inputs and
+    # dispatches inside your CMMS.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${CMMS_MCP_URL:}"           # your CMMS gateway (Maximo, Fiix, eMaint, ...)
+      tool_name: "get_maintenance_history"   # must return the yields below
+      timeout: 30
+    # wake_up: "0 7 * * *"   # daily recurrence sweep — enable after wiring your CMMS connector
+    yields:
+      mode: "string"
+      asset_id: "string"
+      failures_count: "number"
+      total_cost_cents: "number"
+      total_downtime_mins: "number"
+      mtbf_days: "number"
+      overdue_pm_count: "number"
+      overdue_pms: "list"
+      requires_engineer_review: "boolean"
+      history_briefing: "string"
+      horizon_days: "number"
+      total_pms: "number"
+      completed_on_time: "number"
+      overdue_count: "number"
+      overall_compliance_pct: "number"
+      by_asset_class: "list"
+      requires_manager_action: "boolean"
+      pm_compliance_briefing: "string"
+      recurrent_asset_count: "number"
+      recurrent_assets: "list"
+    inputs:
+      mode: "string"
+      asset_id: "string"
+      wo_kind: "string"
+      opened_at_utc: "string"
+      closed_at_utc: "string"
+      cost_cents: "number"
+      technician_id: "string"
+      root_cause: "string"
+      downtime_mins: "number"
+      cadence_days: "number"
+      last_completed: "string"
+      horizon_days: "number"
+      trigger: "string"
+    can_call:
+      # Ledger responsibility — high-frequency failures (MTBF < 14d)
+      # or 3+ overdue PMs → engineer review
+      - agent: "reliability_engineer_human"
+        condition: "calling_agent_response.requires_engineer_review == true"
+
+      # Recurrence sweep — 3+ unscheduled WOs in 30d → engineer
+      - agent: "reliability_engineer_human"
+        condition: "calling_agent_response.recurrent_asset_count > 0"
+
+      # PM-compliance responsibility — below target → ops manager
+      - agent: "ops_manager_human"
+        condition: "calling_agent_response.requires_manager_action == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # equipment_lifecycle_agent — per-asset replacement decisioning
+  # Pure-YAML LLM (no Python module) — the old module's decision
+  # matrix is explicit DECISION POLICY in the prompt, and the wires
+  # below also fire on "recommended_action" so a forgotten flag
+  # can't drop a replace/overhaul recommendation.
+  # ────────────────────────────────────────────────────────────
+  equipment_lifecycle_agent:
+    name: "equipment_lifecycle_agent"
+    agent_type: "llm"
+    description: "Per-asset lifecycle assessment — age, failure history, cost trajectory → continue / overhaul / replace"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1500
+    communication_type: "chain"
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"asset_id": "", "asset_type": "", "age_years": 0, "age_pct_of_design_life": 0, "cumulative_maint_cents": 0, "cost_to_keep_1y_cents": 0, "replacement_cost_cents": 0, "keep_vs_replace_ratio": 0, "failures_lifetime": 0, "warranty_window_days": 0, "warranty_action_window": false, "recommended_action": "", "requires_capex_approval": false, "requires_maintenance_planning": false, "assessed_at_utc": ""}
+      Assemble a lifecycle assessment for this asset from the
+      maintenance records and the asset master. Never invent
+      replacement cost — query the procurement_catalog KB.
+
+      Derive deterministically:
+        - "age_years": years since installation
+        - "age_pct_of_design_life": age_years / design life (cap at 2.0)
+        - "cost_to_keep_1y_cents": lifetime maintenance spend
+          ("cumulative_maint_cents") divided by age in years
+        - "keep_vs_replace_ratio": cost_to_keep_1y_cents /
+          replacement_cost_cents (0 when replacement cost unknown)
+        - "warranty_window_days": days until warranty expiry;
+          "warranty_action_window": true only when 0-60 days remain
+        - "assessed_at_utc": now, ISO-8601 UTC
+
+      DECISION POLICY (hard rules — apply in this order, do not deviate):
+        1. age_pct_of_design_life >= 1.2 AND keep_vs_replace_ratio
+           >= 0.25 → "recommended_action": "replace"
+        2. age_pct_of_design_life >= 1.0 AND "failures_lifetime" >= 5
+           → "recommended_action": "overhaul"
+        3. age_pct_of_design_life >= 0.9 AND keep_vs_replace_ratio
+           >= 0.40 → "recommended_action": "replace"
+        4. otherwise → "recommended_action": "continue"
+
+      Flags (the wires fire on these — set them mechanically):
+        - "requires_capex_approval": true exactly when
+          recommended_action is "replace"
+        - "requires_maintenance_planning": true exactly when
+          recommended_action is "overhaul"
+
+    enforce_yields: true
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "asset_master"
+
+    yields:
+      asset_id: "string"
+      asset_type: "string"
+      age_years: "number"
+      age_pct_of_design_life: "number"
+      cumulative_maint_cents: "number"
+      cost_to_keep_1y_cents: "number"
+      replacement_cost_cents: "number"
+      keep_vs_replace_ratio: "number"
+      failures_lifetime: "number"
+      warranty_window_days: "number"
+      warranty_action_window: "boolean"
+      recommended_action: "string"
+      requires_capex_approval: "boolean"
+      requires_maintenance_planning: "boolean"
+      assessed_at_utc: "string"
+
+    inputs:
+      upstream_yields: "object"
+      asset_id: "string"
+
+    can_call:
+      # Belt-and-braces: also fire on recommended_action so a
+      # forgotten flag can't drop a replace recommendation.
+      - agent: "ops_manager_human"
+        condition: "calling_agent_response.requires_capex_approval == true or calling_agent_response.recommended_action == 'replace'"
+
+      - agent: "work_order_scheduler_agent"
+        condition: "calling_agent_response.requires_maintenance_planning == true or calling_agent_response.recommended_action == 'overhaul'"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # safety_incident_reporter_agent — self-reliant OSHA severity floor.
+  # KEEPS A PYTHON MODULE (agency/safety_incident_reporter_agent.py):
+  #   @pre_compose load_incident_context — pulls its OWN context (asset
+  #     master + open WO + recent history) from the dev store (PROD: EHS
+  #     + EAM/CMMS), so the LLM grounds the narrative in the real asset.
+  #   @chain enforce_severity_floor — the SAFETY-SEVERITY FLOOR the LLM
+  #     can't waive: OSHA windows (8h fatality / 24h hospitalisation-
+  #     amputation-eye-loss / 7-day OSHA 300 log) + recordability are
+  #     statutory data; a recordable/serious outcome forces the mandated
+  #     severity + immediate-escalation route — the LLM cannot down-rate.
+  # ────────────────────────────────────────────────────────────
+  safety_incident_reporter_agent:
+    name: "safety_incident_reporter_agent"
+    agent_type: "llm"
+    description: "Normalises a safety incident; classifies OSHA severity + required state filings"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1200
+    communication_type: "chain"
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"incident_id": "", "occurred_at_utc": "", "asset_id": "", "work_order_id": "", "incident_type": "", "outcome": "", "state": "", "severity": "", "osha_recordable": false, "osha_report_window_hours": 0, "state_filings_required": [], "requires_safety_manager_review": false, "requires_immediate_escalation": false, "recorded_at_utc": ""}
+      Normalise the incident report. Return JSON with these keys:
+        - "occurred_at_utc", "asset_id", "work_order_id"
+        - "incident_type": injury | near_miss | unsafe_condition
+        - "outcome": e.g. death, hospitalisation, amputation, eye_loss,
+            medical_treatment_beyond_first_aid, restricted_work,
+            days_away_from_work, loss_of_consciousness, first_aid_only
+        - "state": 2-letter US state (if applicable)
+
+      The severity, OSHA recordability, statutory reporting windows
+      and escalation flags are computed deterministically from your
+      classification — focus on getting "incident_type", "outcome"
+      and "state" right.
+
+      Be conservative. If outcome is unclear, mark
+      medical_treatment_beyond_first_aid (recordable) rather than
+      first_aid_only (not recordable).
+
+    enforce_yields: true
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "osha_taxonomy"
+
+    yields:
+      incident_id: "string"
+      occurred_at_utc: "string"
+      asset_id: "string"
+      work_order_id: "string"
+      incident_type: "string"
+      outcome: "string"
+      state: "string"
+      severity: "string"
+      osha_recordable: "boolean"
+      osha_report_window_hours: "number"
+      state_filings_required: "list"
+      requires_safety_manager_review: "boolean"
+      requires_immediate_escalation: "boolean"
+      recorded_at_utc: "string"
+
+    inputs:
+      upstream_yields: "object"
+      incident_id: "string"
+
+    can_call:
+      # Serious → immediate escalation path
+      - agent: "ops_manager_human"
+        condition: "calling_agent_response.requires_immediate_escalation == true"
+
+      - agent: "ops_manager_human"
+        condition: "calling_agent_response.requires_safety_manager_review == true and calling_agent_response.requires_immediate_escalation == false"
+
+    auto_store_response: true
+    auto_store_yields: true

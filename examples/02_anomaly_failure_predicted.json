@@ -1,0 +1,17 @@
+{
+  "_entry_point": "sensor_reading",
+  "_description": "Extruder-7 (the seeded demo asset) vibration in ISO 10816 zone D — the failure-probability severity floor clamps RUL into the 24h window and the safety-critical hard-stop forces engineer review; the work order is forced emergency and the parts gate holds (bearing 72h lead > RUL).",
+  "payload": {
+    "asset_id": "extruder-7",
+    "asset_type": "extruder",
+    "reading": {
+      "vibration_rms_mm_s": 11.8,
+      "temp_c": 96,
+      "current_a": 24.9,
+      "anomaly": true,
+      "anomaly_score": 0.91,
+      "trend_3d": "rising"
+    },
+    "ts_utc": "2026-06-23T06:14:00Z"
+  }
+}

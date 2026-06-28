@@ -1,0 +1,15 @@
+{
+  "_entry_point": "sensor_reading",
+  "_description": "Normal-band IIoT reading \u2014 condition_sensor_agent confirms, no anomaly, no downstream agents fire.",
+  "payload": {
+    "asset_id": "pump-103-coolant",
+    "asset_type": "centrifugal_pump",
+    "reading": {
+      "vibration_rms_mm_s": 1.8,
+      "temp_c": 62,
+      "current_a": 14.2,
+      "anomaly": false
+    },
+    "ts_utc": "2026-06-04T14:00:00Z"
+  }
+}

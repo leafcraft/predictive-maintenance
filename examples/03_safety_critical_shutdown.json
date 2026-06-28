@@ -1,0 +1,12 @@
+{
+  "_entry_point": "shutdown_request",
+  "_description": "Operator requests manual shutdown \u2014 reliability_engineer immediately involved.",
+  "payload": {
+    "request_id": "shutdown-2026-0604-001",
+    "asset_id": "compressor-211-main",
+    "requested_by": "operator.yann@example",
+    "reason": "Audible whine, visible oil leak at base \u2014 proactive shutdown before mechanical seal fails.",
+    "safety_critical": true,
+    "shift_supervisor_notified": true
+  }
+}

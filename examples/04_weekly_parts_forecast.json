@@ -1,0 +1,13 @@
+{
+  "_entry_point": "weekly_parts_forecast",
+  "_description": "Mon 08:00 cron \u2014 spare_parts_forecaster predicts 90-day parts demand.",
+  "payload": {
+    "forecast_id": "parts-forecast-2026-W23",
+    "horizon_days": 90,
+    "asset_classes": [
+      "centrifugal_pumps",
+      "compressors",
+      "heat_exchangers"
+    ]
+  }
+}
