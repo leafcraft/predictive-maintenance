@@ -1,11 +1,18 @@
-"""predictive-maintenance — Predictive Maintenance.
+"""predictive-maintenance — Predictive-Maintenance Pod (LeafMesh).
 
-YAML-first: the mesh is defined in configs/config.yaml. Sensor data
-comes from your plant historian (HISTORIAN_MCP_URL) and work orders
-live in your CMMS (CMMS_MCP_URL) via connectors — no template storage.
-The only Python agents are the fail-closed work-order actuator and the
-OSHA deadline tables; this file just boots the mesh and registers the
-WORM audit sink.
+Boot order matters (SDK 2.4.131):
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+     so Cass's claim_next_asset / read_condition_signals and Rex's telemetry tools
+     are registered.
+  2. LeafMesh.from_yaml(...) → auto_discover wires agency/*_agent.py to the YAML.
+  3. audit_logger.register(...) → attach the WORM sink to the custom external
+     maint_audit_logger_agent (after from_yaml, before start).
+  4. leafmesh.start().
+
+YAML-first: the mesh is defined in configs/config.yaml. Sensor data comes from
+your plant historian (HISTORIAN_MCP_URL / plant_iiot broker) and work orders live
+in your CMMS (CMMS_MCP_URL) via connectors; day-0 the pod runs on the seed dev
+store with no connector wired.
 """
 import asyncio
 import signal
@@ -14,6 +21,7 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
+import agency.tools  # noqa: F401 — registers @global_tool tools before start()
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()

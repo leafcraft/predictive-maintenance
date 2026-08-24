@@ -91,6 +91,17 @@ _SEED_ASSETS = {
         "warranty_expires_utc": _days(120),
         "line_id": "LINE-1",
     },
+    # A third fleet asset so the scheduled fan-out (instances: 3) claims three
+    # DISJOINT assets per sweep — a nominal conveyor (clean-pass control).
+    "conveyor-3": {
+        "asset_id": "conveyor-3", "asset_type": "belt_conveyor",
+        "criticality": "standard",
+        "installed_utc": _days(-365 * 2),      # 2 years old
+        "design_life_years": 12,
+        "replacement_cost_cents": 900_000,     # $9k
+        "warranty_expires_utc": _days(300),
+        "line_id": "LINE-2",
+    },
 }
 
 # ── Seed: the latest condition reading per asset + a short series ─────
@@ -129,6 +140,22 @@ _SEED_READINGS = {
         "dominant_signature": "none",
         "vibration_series_3d": [2.4, 2.5, 2.5, 2.6, 2.6],
         "temp_series_3d": [60, 60, 61, 61, 62],
+    },
+    "conveyor-3": {
+        "asset_id": "conveyor-3",
+        "captured_at_utc": None,
+        "vibration_rms_mm_s": 1.9,
+        "vibration_baseline_mm_s": 1.8,
+        "temp_c": 41.0,
+        "temp_baseline_c": 40.0,
+        "current_a": 8.1,
+        "current_baseline_a": 8.0,
+        "anomaly_detected": False,
+        "anomaly_score": 0.05,
+        "trend_3d": "flat",
+        "dominant_signature": "none",
+        "vibration_series_3d": [1.8, 1.8, 1.9, 1.9, 1.9],
+        "temp_series_3d": [40, 40, 40, 41, 41],
     },
 }
 
@@ -351,6 +378,91 @@ def parts_demand_signals(window_days: int = 90) -> list[dict[str, Any]]:
             "days_to_stockout": days_to_stockout,
         })
     return out
+
+
+# ── Condition-signal read (dev-store fallback for the historian tool) ─────
+def read_condition_signals(asset_id: str) -> dict[str, Any]:
+    """The condition sensor's day-0 read: the latest signature + an anomaly
+    flag for an asset. Announces available:false when there is no seed (and no
+    historian). PROD: the historian mcp gateway returns this shape."""
+    r = latest_reading(asset_id)
+    if not r:
+        return {"available": False, "asset_id": asset_id,
+                "reason": f"no seed reading for {asset_id!r}; wire HISTORIAN_MCP_URL"}
+    summary = {
+        "vibration_rms_mm_s": r.get("vibration_rms_mm_s"),
+        "vibration_baseline_mm_s": r.get("vibration_baseline_mm_s"),
+        "temp_c": r.get("temp_c"),
+        "temp_baseline_c": r.get("temp_baseline_c"),
+        "current_a": r.get("current_a"),
+        "trend_3d": r.get("trend_3d"),
+        "dominant_signature": r.get("dominant_signature"),
+        "anomaly_score": r.get("anomaly_score"),
+        "captured_at_utc": r.get("captured_at_utc"),
+    }
+    return {"available": True, "asset_id": asset_id,
+            "sensor_summary": summary,
+            "anomaly_detected": bool(r.get("anomaly_detected"))}
+
+
+# ── Fleet inspection backlog + ATOMIC claim (drives instances fan-out) ────
+def _fleet_backlog() -> list[str]:
+    """The queue of assets due for a condition sweep. In prod this is your
+    'due-for-inspection' query; the dev store reseeds from the asset master
+    whenever it empties so the demo always finds work to fan across."""
+    bl = _load("fleet_backlog")
+    if not bl:
+        bl = list(_seeded("assets", _SEED_ASSETS).keys())
+        _save("fleet_backlog", bl)
+    return bl
+
+
+def claim_next_asset() -> dict[str, Any]:
+    """Atomically pop the next asset from the inspection backlog. Two parallel
+    callers never get the same asset. Returns available:false when empty."""
+    with _LOCK:
+        bl = _fleet_backlog()
+        if not bl:
+            return {"available": False, "reason": "inspection backlog empty"}
+        asset_id = bl.pop(0)
+        _save("fleet_backlog", bl)
+    return {"available": True, "asset_id": asset_id}
+
+
+# ── Issuer recovery + outbox + append-only ledger (dev mirror of the WORM) ──
+def put_pending_wo(work_order_id: str, wo: dict[str, Any]) -> None:
+    """Stash a planned work order so the issuer can recover it across the HITL
+    approval gap (upstream payload is dropped after a human gate)."""
+    if not work_order_id:
+        return
+    with _LOCK:
+        pend = _load("pending_wos") or {}
+        pend[work_order_id] = {"stored_at": _now(), **wo}
+        _save("pending_wos", pend)
+
+
+def get_pending_wo(work_order_id: str) -> dict[str, Any]:
+    return dict((_load("pending_wos") or {}).get(str(work_order_id), {}))
+
+
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    """Record the issuer's send to the CMMS (dev outbox — no real dispatch)."""
+    with _LOCK:
+        outbox = _load("outbox") or []
+        rec = {"recorded_at": _now(), **entry}
+        outbox.append(rec)
+        _save("outbox", outbox)
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only work-order ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        ledger = _load("wo_ledger") or []
+        rec = {"recorded_at": _now(), **entry}
+        ledger.append(rec)
+        _save("wo_ledger", ledger)
+    return rec
 
 
 def failure_probability(asset_id: str = DEMO_ASSET) -> dict[str, Any]:

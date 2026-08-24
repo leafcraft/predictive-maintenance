@@ -1,6 +1,6 @@
 {
   "_entry_point": "sensor_reading",
-  "_description": "Normal-band IIoT reading \u2014 condition_sensor_agent confirms, no anomaly, no downstream agents fire.",
+  "_description": "Normal-band IIoT reading \u2014 Mira (coordinator) opens the case and hands it to Rex, who scores the asset healthy; no anomaly, no work order, no downstream gate fires.",
   "payload": {
     "asset_id": "pump-103-coolant",
     "asset_type": "centrifugal_pump",

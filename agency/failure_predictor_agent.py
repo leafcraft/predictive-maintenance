@@ -1,26 +1,20 @@
-"""failure_predictor_agent — self-reliant predictive reliability analyst.
+"""failure_predictor_agent — Rex, the predictive reliability analyst.
 
-@pre_compose  load_condition — the analyst pulls its OWN context before
-              reasoning: the short telemetry series + maintenance history
-              for the asset from the dev store (PROD: HISTORIAN_MCP_URL /
-              CMMS_MCP_URL), plus the deterministic failure-probability
-              score the floor below reads. Not spoon-fed by a conductor.
-@chain        enforce_floors — two deterministic floors the LLM CANNOT
-              waive:
-                (1) failure-probability severity floor — when the
-                    model-agnostic risk score says failure within 24h is
-                    likely (>= 0.7), the RUL is clamped into the shutdown
-                    window and safety_critical is forced true, regardless
-                    of an optimistic LLM verdict;
-                (2) safety-critical hard-stop — a safety-critical asset
-                    (asset master) OR a low-confidence prediction inside
-                    the 24h window forces safety_critical true and routes
-                    the reliability engineer. The wires fire on the
-                    post-floor values, so a lenient LLM can't drop the gate.
+A Super-Agent (plan → execute → verify) that PULLS its own data through tools
+(read_condition_signals, read_asset_history, failure_probability_score — the
+day-0 dev surface in agency/tools.py, the historian mcp block in prod) and
+scores remaining useful life, failure mode and confidence. The MODEL decides and
+pulls; this CODE fails closed.
 
-Was pure-YAML; promoted to a module because "self-reliant + deterministic
-floor" is exactly the depth bar — the prompt alone could be talked out of
-the safety call.
+@chain enforce_floors — two deterministic safety floors the LLM CANNOT waive,
+re-derived in code from the store (not trusted from the model):
+  (1) failure-probability severity floor — when the model-agnostic risk score
+      says failure within 24h is likely (>= 0.7), the RUL is clamped into the
+      shutdown window and safety_critical is forced, whatever the LLM estimated;
+  (2) safety-critical hard-stop — a safety-critical asset (asset master) OR a
+      low-confidence prediction inside the 24h window forces safety_critical and
+      routes the reliability engineer.
+The mesh wires fire on the POST-floor values, so a lenient LLM can't drop the gate.
 """
 from __future__ import annotations
 
@@ -28,30 +22,36 @@ import json
 import re
 from typing import Any
 
-from leafmesh import LeafMeshLogger, pre_compose, chain
-from agency._shared import store
+from leafmesh import LeafMeshLogger, chain
+
+try:
+    from ._shared import store
+except ImportError:  # pragma: no cover
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _shared import store  # type: ignore
 
 logger = LeafMeshLogger(__name__)
 
-# Failure-probability severity floor: at/above this, failure within 24h
-# is treated as likely → RUL clamped into the window, safety forced.
+# Failure-probability severity floor: at/above this, failure within 24h is
+# treated as likely → RUL clamped into the window, safety forced.
 FAILURE_PROB_FLOOR = 0.7
 SHUTDOWN_WINDOW_HOURS = 24.0
-# A clamped RUL the floor assigns when it overrides an optimistic LLM.
-FLOOR_CLAMPED_HOURS = 12.0
+FLOOR_CLAMPED_HOURS = 12.0        # the clamped RUL when the floor overrides
 LOW_CONF = 0.7
 
 _DEFAULTS: dict[str, Any] = {
-    "predicted_failure_hours": 168.0, "failure_mode": "unknown",
-    "confidence": 0.0, "safety_critical": False, "engineer_briefing": "",
+    "asset_id": "", "predicted_failure_hours": 168.0, "failure_mode": "unknown",
+    "confidence": 0.0, "safety_critical": False, "failure_prob_24h": 0.0,
+    "engineer_briefing": "",
 }
 
 
 def _asset_id(data: Any) -> str:
     if isinstance(data, dict):
-        for k in ("asset_id",):
-            if data.get(k):
-                return str(data[k])
+        if data.get("asset_id"):
+            return str(data["asset_id"])
         for blob in (data.get("upstream_yields"), data.get("payload")):
             if isinstance(blob, dict):
                 if blob.get("asset_id"):
@@ -60,19 +60,6 @@ def _asset_id(data: Any) -> str:
                     if isinstance(v, dict) and v.get("asset_id"):
                         return str(v["asset_id"])
     return store.DEMO_ASSET
-
-
-def load_condition(data: Any, ctx: Any) -> dict[str, Any]:
-    """@pre_compose — the analyst pulls its own context: telemetry series,
-    asset master, recent history, and the deterministic risk score."""
-    aid = _asset_id(data)
-    return {
-        "asset_id": aid,
-        "asset_record": store.asset(aid),
-        "signal_series": store.signal_series(aid),
-        "recent_history": store.asset_history(aid)[-3:],
-        "failure_score": store.failure_probability(aid),
-    }
 
 
 def _parse(resp: Any) -> dict[str, Any]:
@@ -91,25 +78,13 @@ def _parse(resp: Any) -> dict[str, Any]:
     return {}
 
 
-def _prepared(ctx: Any) -> dict[str, Any]:
-    """Recover what load_condition stashed (SDK puts pre_compose output on
-    the context under prepared_data; tolerate a couple of shapes)."""
-    if isinstance(ctx, dict):
-        for k in ("prepared_data", "prepared", "pre_compose"):
-            v = ctx.get(k)
-            if isinstance(v, dict) and v:
-                return v
-        if ctx.get("failure_score") or ctx.get("asset_record"):
-            return ctx
-    return {}
-
-
 async def enforce_floors(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    """@chain — deterministic floors the LLM can't waive."""
+    """@chain — deterministic safety floors the LLM can't waive. Re-derives the
+    risk score + asset criticality from the store (never trusts the model)."""
+    result = result if isinstance(result, dict) else {}
     aid = str(result.get("asset_id") or "") or store.DEMO_ASSET
-    prepared = _prepared(ctx)
-    score = prepared.get("failure_score") or store.failure_probability(aid)
-    asset_rec = prepared.get("asset_record") or store.asset(aid)
+    score = store.failure_probability(aid)
+    asset_rec = store.asset(aid)
 
     prob = float(score.get("failure_prob_24h") or 0.0)
     try:
@@ -120,17 +95,13 @@ async def enforce_floors(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
     floors: list[str] = []
 
-    # (1) Failure-probability severity floor — the model-agnostic score
-    #     says failure within 24h is likely; clamp the RUL into the window
-    #     and force the safety flag, regardless of an optimistic LLM.
+    # (1) Failure-probability severity floor.
     if prob >= FAILURE_PROB_FLOOR and hours >= SHUTDOWN_WINDOW_HOURS:
         hours = FLOOR_CLAMPED_HOURS
         result["safety_critical"] = True
         floors.append(f"failure_prob={prob:.2f}>={FAILURE_PROB_FLOOR}→RUL clamped {hours:.0f}h")
 
-    # (2) Safety-critical hard-stop — a safety-critical asset always trips
-    #     the engineer; a low-confidence prediction inside the shutdown
-    #     window is treated defensively (never optimistically).
+    # (2) Safety-critical hard-stop.
     if str(asset_rec.get("criticality") or "") == "safety_critical":
         result["safety_critical"] = True
         floors.append("asset criticality=safety_critical")
@@ -149,13 +120,14 @@ async def enforce_floors(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
     return result
 
 
-@pre_compose(context_processor=load_condition)
 @chain(enforce_floors)
 async def failure_predictor_agent(llm_response: Any, input_data: Any,
                                   context: Any) -> dict[str, Any]:
+    """Normalise the model's RUL estimate into the yields contract; the safety
+    floors (@chain) run next and are authoritative for safety_critical."""
     llm = _parse(llm_response)
     out = {**_DEFAULTS}
-    aid = _asset_id(input_data)
+    aid = str(llm.get("asset_id") or "") or _asset_id(input_data)
     sig = store.signal_series(aid)
 
     try:

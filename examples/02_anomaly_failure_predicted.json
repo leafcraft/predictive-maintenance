@@ -1,6 +1,6 @@
 {
   "_entry_point": "sensor_reading",
-  "_description": "Extruder-7 (the seeded demo asset) vibration in ISO 10816 zone D — the failure-probability severity floor clamps RUL into the 24h window and the safety-critical hard-stop forces engineer review; the work order is forced emergency and the parts gate holds (bearing 72h lead > RUL).",
+  "_description": "Extruder-7 (seeded demo asset) vibration in ISO 10816 zone D \u2014 Mira opens the case; Rex's failure-probability severity floor clamps RUL into the 24h window and the safety-critical hard-stop forces engineer review; Wanda plans an emergency work order and the parts gate holds (bearing 72h lead > RUL) so it routes to the reliability engineer, not the issuer.",
   "payload": {
     "asset_id": "extruder-7",
     "asset_type": "extruder",

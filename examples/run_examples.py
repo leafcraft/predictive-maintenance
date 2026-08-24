@@ -17,7 +17,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Register the audit connector before SDK start
+# Register the day-0 @global_tool surface + the audit connector before SDK start
+import agency.tools  # noqa: F401
 import agency._shared.audit_logger  # noqa: F401
 
 from leafmesh import LeafMesh, LeafMeshLogger

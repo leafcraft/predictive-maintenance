@@ -1,12 +1,12 @@
 # predictive-maintenance — example scenarios
 
-Four realistic scenarios that exercise the major paths through this mesh.
+Four realistic scenarios that exercise the major paths through this pod.
 
-YAML-first note: `condition_sensor_agent` reads from your plant
-historian (`HISTORIAN_MCP_URL`) and `maintenance_records_agent` from
-your CMMS (`CMMS_MCP_URL`) via MCP connectors — wire those gateways
-(see `configs/config.yaml`) before running scenarios 01 and 02
-end-to-end.
+Day-0 note: the pod runs on the **seed dev store** (`agency/_shared/store.py`)
+with no connector wired — `read_condition_signals` and the RUL tools read the
+seed asset. Wire your historian (`HISTORIAN_MCP_URL` / `IIOT_MQTT_HOST`) and CMMS
+(`CMMS_MCP_URL`) for live data (see `configs/config.yaml`). `sensor_reading` now
+enters through **Mira, the coordinator**, who opens the case and hands it to Rex.
 
 ## How to run
 
@@ -17,10 +17,10 @@ python examples/run_examples.py 01_             # one scenario (substring match)
 
 ## Scenario map
 
-- **01_routine_sensor_reading** — `sensor_reading` — Normal-band IIoT reading — condition_sensor_agent confirms, no anomaly, no downstream agents fire.
-- **02_anomaly_failure_predicted** — `sensor_reading` — Vibration spike — anomaly=true → failure_predictor_agent runs RUL model → 18h to failure, safety-critical false.
-- **03_safety_critical_shutdown** — `shutdown_request` — Operator requests manual shutdown — reliability_engineer immediately involved.
-- **04_weekly_parts_forecast** — `weekly_parts_forecast` — Mon 08:00 cron — spare_parts_forecaster predicts 90-day parts demand.
+- **01_routine_sensor_reading** — `sensor_reading` — Normal-band reading — Mira opens the case, Rex scores it healthy, no work order, no gate fires.
+- **02_anomaly_failure_predicted** — `sensor_reading` — Vibration spike on Extruder-7 — Rex's safety floors clamp RUL into the 24h window + force engineer review; Wanda plans an emergency work order; the parts gate holds → reliability engineer.
+- **03_safety_critical_shutdown** — `shutdown_request` — Operator requests a manual shutdown — the reliability engineer is involved immediately.
+- **04_weekly_parts_forecast** — `weekly_parts_forecast` — Mon 08:00 cron — Perry forecasts 90-day parts demand; the stockout floor forces the known bearing shortage.
 
 ## Audit trail
 

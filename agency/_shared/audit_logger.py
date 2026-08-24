@@ -39,7 +39,7 @@ _LAST_HASH = "GENESIS"
 # Default sink — overridden by connector_config in config.yaml when the
 # SDK passes it through; kept as module default so the intelligence
 # path (which receives no connector_config) still lands in the same file.
-DEFAULT_AUDIT_PATH = "./logs/audit.jsonl"
+DEFAULT_AUDIT_PATH = "./logs/maint_audit.jsonl"
 
 # Human/meta keys that are transport plumbing, not audit payload.
 _META_KEYS = frozenset({
@@ -139,7 +139,7 @@ try:  # pragma: no cover — exercised only on old SDKs
     from leafmesh.external.registry import register_connector
 
     @register_connector("custom")
-    class FinanceAuditLoggerConnector(ExternalConnector):  # type: ignore[misc]
+    class MaintAuditLoggerConnector(ExternalConnector):  # type: ignore[misc]
         """Append-only hash-chained audit sink (legacy connector API)."""
 
         async def execute(self, input_data: dict[str, Any],
