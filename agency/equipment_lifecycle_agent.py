@@ -65,6 +65,14 @@ def _age_years(installed_utc: str) -> float:
         return 0.0
 
 
+def _within_days(iso: Any, days: int) -> bool:
+    try:
+        t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (datetime.now(timezone.utc) - t).days <= days
+
+
 def load_asset_dossier(data: Any, ctx: Any) -> dict[str, Any]:
     """@pre_compose — pull the asset master + full maintenance history and
     pre-derive the deterministic numbers the LLM should not invent."""
@@ -76,7 +84,10 @@ def load_asset_dossier(data: Any, ctx: Any) -> dict[str, Any]:
     age = _age_years(rec.get("installed_utc", ""))
     design = float(rec.get("design_life_years") or 0.0) or 1.0
     repl = int(rec.get("replacement_cost_cents") or 0)
-    keep_1y = int(cumulative / age) if age else 0
+    # Cost to keep for another year = the trailing-12-month maintenance spend
+    # (what the asset is costing now), not the lifetime average.
+    keep_1y = sum(int(h.get("cost_cents") or 0) for h in history
+                  if _within_days(h.get("closed_at_utc") or h.get("opened_at_utc"), 365))
     ratio = round(keep_1y / repl, 3) if repl else 0.0
     return {
         "asset_id": aid, "asset_record": rec, "history_count": len(history),

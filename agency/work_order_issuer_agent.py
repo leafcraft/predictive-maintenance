@@ -1,7 +1,7 @@
 """work_order_issuer_agent — Ivan, the work-order issuer (the FINISHER / actuator).
 
 auto_discover matches `work_order_issuer_agent`. Ivan sits BEHIND the reliability
-engineer's approval gate. It never authorises a shutdown or issues on its own
+engineer's approval step. It never authorises a shutdown or issues on its own
 belief — it re-checks that a human actually authorised the job, renders the
 approved work-order pack, dispatches the technician, and records an append-only
 ledger entry. It is the concrete "@chain fails closed":

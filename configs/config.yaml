@@ -9,7 +9,7 @@
 # OSHA safety-incident classification.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every
-# hand-off is a finished contract; every human gate default-denies on
+# hand-off is a finished contract; nothing is issued or approved on
 # silence; the finisher produces the real artifact and fails closed; the
 # WORM sink is the terminus. Systems (historian / CMMS / ERP-MRP) are
 # TOOLS inside agents, never members.
@@ -24,26 +24,18 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 604800
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the Ops Manager. It is
-# NOT a router in the middle of the team (static routing).
+# The Manager is the SUPERVISOR, not a router in the middle of the team
+# (static routing). It escalates to the Ops Manager on a non-retryable error
+# (auth / bad request / credit / bad config), when 3 different agents fail in
+# one case (max_errors_per_session), or when restarts run out. A contract
+# violation (a malformed hand-off) only alerts. A question nobody answers is
+# NOT escalated: the card closes and the ticket records that no reply came.
+# The safety / parts-gap / re-work routes to the engineer are can_call wires.
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -53,53 +45,63 @@ manager:
     safety floors) -> Wanda (plan the work order, parts gate) -> the
     reliability engineer reviews shutdown/parts-gap decisions -> Ivan
     ISSUES the approved work-order pack and dispatches a technician ->
-    WORM audit. Escalate to the Ops Manager when: a predicted failure is
-    inside the 24h window OR the asset is safety-critical, a part's lead
-    time exceeds the remaining useful life, an asset loops on re-work past
-    its bound, a human gate times out, or any agent hands off a malformed
-    artifact. Silence never advances a work order.
+    WORM audit. The team's own wires send a failure inside the 24h window,
+    a safety-critical asset, a parts lead time longer than the remaining
+    useful life, and an exhausted re-work loop to the reliability engineer.
+    You escalate to the Ops Manager when agents keep failing. Silence never
+    advances a work order.
   routing:
     mode: "static"
   escalation:
     targets:
       - type: "human_agent"
         agent: "ops_manager_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{asset_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_MAINT_CHANNEL:}"
-        message_template: "[maint] {{message}} — asset {{asset_id}}"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live, no restart).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{asset_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack escalation: posting needs a Slack adapter, which comes from a
+      # human seat's channels block. Connect Slack on Infrastructure →
+      # Messaging → Slack (vault record, e.g. 'slack_maint'), give
+      # ops_manager_human `channels: {slack: {connection: slack_maint}}`, set
+      # SLACK_MAINT_CHANNEL in .env, then uncomment — here before the first
+      # start, in Studio's YAML editor after it. Shipped commented because with
+      # no adapter the target cannot deliver anything.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_MAINT_CHANNEL:}"
+        # message_template: "[maint] {{message}} — asset {{asset_id}}"
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — RUL analysis runs a Super-Agent plan/execute/
 # verify loop that can run long. The 2.4.131 default dropped to 90s; this
 # block is REJECTED by <=2.4.130, so it lands with the 2.4.131 floor.
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 # ── IIoT event source (BRD-021) — Cass binds a live condition-signal
-#    stream here (see listen_events). Inert until IIOT_MQTT_HOST is set;
-#    the pod runs day-0 on the seed store with no broker. ──
-brokers:
-  plant_iiot:
-    type: mqtt
-    host: "${IIOT_MQTT_HOST:}"
-    port: ${IIOT_MQTT_PORT:1883}
+#    stream here (see listen_events). Off until the vault connection
+#    'plant_iiot' exists and this block is uncommented; the pod runs day-0 on
+#    the seed store with no broker. ──
+# brokers:
+  # Day 0 this broker is off: create the vault connection 'plant_iiot' on
+  # Infrastructure → Brokers & queues → MQTT, then uncomment it and
+  # its agents' listen_events — here before the first start, in Studio's YAML
+  # editor after it (applies live, no restart).
+  # plant_iiot:
+    # type: mqtt
+    # connection: plant_iiot   # vault connection (Infrastructure → Brokers & queues → MQTT) holds the address
 
 # Documents the ingress event shape (a condition reading from your
 # historian / IIoT platform). Optional; kept as a contract note.
@@ -127,7 +129,7 @@ entry_points:
 
   - name: "scheduled_inspection"
     target: "condition_sensor_agent"
-    description: "Routine PM fleet sweep (cron) — Cass fans across assets (instances) and reads each."
+    description: "Routine PM fleet sweep (cron) — Cass fans across assets (parallel copies) and reads each."
     condition: always
 
   - name: "work_order_filed"
@@ -249,7 +251,7 @@ agents:
   # Cass — Condition-Monitoring Engineer (AI/programmatic reader). Pulls the
   # vibration / temp / current signature for an asset and flags anomalies.
   # The PROACTIVE reader: a scheduled fleet sweep (wake_up) and a live IIoT
-  # stream (listen_events) both fan CASS across many assets — `instances`
+  # stream (listen_events) both fan CASS across many assets — `scaling.copies`
   # spins up parallel copies and each ATOMICALLY CLAIMS the next asset from
   # the inspection backlog (claim_next_asset), so copies split the fleet
   # instead of duplicating work. Day-0 it reads the seed store and announces
@@ -265,33 +267,26 @@ agents:
     # each atomically CLAIMS a disjoint asset (store.claim_next_asset — the same
     # atomic op exposed as the claim_next_asset global tool) so copies split the
     # fleet instead of duplicating work.
-    instances: 3
-    instances_handoff: each          # each anomalous asset routes its own prediction
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3
+        handoff: each          # each anomalous asset routes its own prediction
     # Routine PM fleet sweep — daily, in the plant's timezone (NOT UTC). Runs
     # day-0 against the seed store; needs no connector. ONE cron line — with
-    # instances:3 that is 3 runs (one per claimed asset), not 3×N.
+    # copies.count: 3 that is 3 runs (one per claimed asset), not 3×N.
     wake_up: "0 6 * * *"
     timezone: "Asia/Kolkata"
     wake_up_input:
       trigger: scheduled_inspection
     # Live IIoT stream — binds to the plant_iiot broker (top-level `brokers:`).
-    # Inert until IIOT_MQTT_HOST is set; parallel to wake_up.
-    listen_events:
-      - broker: plant_iiot
-        mqtt_topic: "plant/+/condition"
-        qos: 1
-    # ── To wire a real historian, uncomment and set the URL (each named action
-    #    under `use:` becomes its own tool, e.g. historian_read_signals). NOTE:
-    #    the SDK rejects an http mcp block with an EMPTY url at load, so this
-    #    ships commented — fill the URL, then uncomment. Day-0 uses the
-    #    read_condition_signals dev tool (seed store). ──
-    # mcp:
-    #   - transport: http
-    #     url: "${HISTORIAN_MCP_URL}"     # PI / Ignition / ThingWorx gateway
-    #     token: "${HISTORIAN_MCP_TOKEN:}"
-    #     use: [read_signals, read_series]
-    #     name: historian
-    #     timeout: 30
+    # Off on day 0: create vault connection 'plant_iiot', then uncomment this
+    # and the broker (here before the first start, in Studio's YAML editor
+    # after it). Parallel to wake_up.
+    # listen_events:
+      # - broker: plant_iiot
+        # mqtt_topic: "plant/+/condition"
+        # qos: 1
     yields:
       asset_id: "string"
       sensor_summary: "object"
@@ -392,14 +387,34 @@ agents:
     # is no real source. See agency/tools.py.
     tools: [read_condition_signals, read_asset_history, failure_probability_score]
     tool_categories: [reliability]
+    # ── To wire a real historian (PI / Ignition / ThingWorx gateway): create
+    #    the vault connection 'historian_mcp' on Infrastructure → Integrations
+    #    → MCP (or an "Add custom" record, service type Tools, whose base URL is
+    #    the address) — the address + token are entered only in the vault,
+    #    never as url:/token: here — then uncomment (here before the first
+    #    start, in Studio's YAML editor after it). The day-0 tools in
+    #    agency/tools.py see the same vault record and say so in their
+    #    answers. Each named action under `use:` becomes its own tool, e.g.
+    #    historian_read_signals. The block lives on Rex (an llm
+    #    agent): `mcp:` is refused on a programmatic agent such as Cass. ──
+    # mcp:
+    #   - connection: historian_mcp
+    #     transport: http
+    #     use: [read_signals, read_series]
+    #     name: historian
+    #     timeout: 30
     inputs:
       upstream_yields: "object"
       asset_id: "string"
     can_call:
-      # A valid prediction always yields a work-order plan (fails closed if the
-      # field is absent).
+      # A prediction inside the 30-day planning horizon (720h) yields a
+      # work-order plan (fails closed if the field is absent).
       - agent: "work_order_scheduler_agent"
-        condition: "calling_agent_response.predicted_failure_hours >= 0"
+        condition: "calling_agent_response.predicted_failure_hours >= 0 and calling_agent_response.predicted_failure_hours < 720"
+      # A healthy asset (RUL beyond the horizon, not safety-critical) gets no
+      # work order — the score is recorded in the audit trail and the case ends.
+      - agent: "maint_audit_logger_agent"
+        condition: "calling_agent_response.predicted_failure_hours >= 720 and calling_agent_response.safety_critical == false"
       # Deterministic safety floor (enforced by @chain AND this wire): a forced
       # safety_critical flag, OR a low-confidence prediction inside the 24h
       # window, loops in the reliability engineer regardless of the LLM's optimism.
@@ -491,57 +506,55 @@ agents:
         condition: always
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
-  # `dual` belongs on the human/webhook boundary agents ONLY; a human never
-  # can_call another `dual` human (that ping-pongs) — escalation between humans
-  # is the Manager SUPERVISOR's job (manager.escalation.targets).
+  # Human members — first-class, answered in Studio's Inbox.
+  # Timeouts follow plant working practice: the on-call reliability engineer
+  # answers a P1 within 1h; a technician reports by the end of an 8h shift;
+  # the ops manager answers within 4h (a fatality must reach OSHA within 8h).
+  # If nobody answers in time, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nothing is issued,
+  # dispatched or approved on silence, and nobody is chased automatically.
+  # fallback_on_timeout / fallback_response state the intended default-deny
+  # (held_for_review -> audit); leafmesh 2.4.486 does not route it for these
+  # dual seats yet.
+  # A human never can_call another `dual` human (that ping-pongs).
+  # Every value a seat asks for has a route (approved / rejected /
+  # held_for_review ...), so no answer ends the case unrecorded.
   # ─────────────────────────────────────────────────────────────────────────
 
   reliability_engineer_human:
     name: "reliability_engineer_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 14400        # 4h to review a shutdown / parts-gap
+    human_timeout_seconds: 3600         # 1h — on-call engineer, P1 safety / parts-gap review
     description: "Reliability engineer — reviews shutdown / unscheduled / parts-gap decisions; approves or holds."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     # operator_ids: ["you@yourcompany.com"]   # optional — unset routes to the
     #   SHARED inbox. Only set real emails: a placeholder assigns to nobody.
     can_call:
       - agent: "work_order_issuer_agent"
         condition: "calling_agent_response.human_message == 'approved'"
       - agent: "maint_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"           # approved | held_for_review
+      human_message: "string"           # approved | rejected | held_for_review
     inputs:
       briefing: "object"
 
   technician_human:
     name: "technician_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 7200         # 2h to do / report the repair
+    human_timeout_seconds: 28800        # 8h — one shift to do the repair and report it
     description: "Maintenance technician — does the repair; reports completed / parts_issue."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       # Bounded re-work back-edge: a parts problem re-enters the planner, which
       # counts the rounds and escalates to the engineer at the cap.
@@ -557,18 +570,14 @@ agents:
   ops_manager_human:
     name: "ops_manager_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 21600        # 6h — production-impact tier
-    description: "Ops manager — production-impact tier: capex sign-off, safety escalations, held flows."
+    human_timeout_seconds: 14400        # 4h — production-impact tier; leaves time inside OSHA's 8h window
+    description: "Ops manager — production-impact tier: capex sign-off, safety-incident escalations, critical parts shortages, PM-compliance misses."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: "maint_audit_logger_agent"
         condition: always
@@ -585,7 +594,7 @@ agents:
     name: "maint_audit_logger_agent"
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "WORM audit — hash-chains every issue, dispatch, approval, hold, and forecast. Terminus."
     connector_config:
       sink_type: "local_file"
@@ -638,12 +647,19 @@ agents:
       {"parts_needed_30d": ..., "parts_needed_60d": ..., "parts_needed_90d": ...,
        "critical_shortages": ..., "overstock_candidates": ..., "executive_summary": ...,
        "confidence_overall": ...}
+      Each parts_needed_* item is {"part_sku", "qty"}; each critical_shortages
+      item is {"part_sku", "current_stock", "predicted_demand_days",
+      "days_to_stockout"}; each overstock_candidates item is {"part_sku", "on_hand"}.
     yields:
-      parts_needed_30d: "list"
-      parts_needed_60d: "list"
-      parts_needed_90d: "list"
-      critical_shortages: "list"
-      overstock_candidates: "list"
+      parts_needed_30d: {type: array, items: {type: object, fields: {part_sku: string, qty: number}}}
+      parts_needed_60d: {type: array, items: {type: object, fields: {part_sku: string, qty: number}}}
+      parts_needed_90d: {type: array, items: {type: object, fields: {part_sku: string, qty: number}}}
+      critical_shortages:
+        type: array
+        items:
+          type: object
+          fields: {part_sku: string, current_stock: number, predicted_demand_days: number, days_to_stockout: number}
+      overstock_candidates: {type: array, items: {type: object, fields: {part_sku: string, on_hand: number}}}
       executive_summary: "string"
       confidence_overall: "number"
     playbook:
@@ -673,7 +689,8 @@ agents:
   # Mara — Maintenance Records Analyst (programmatic connector). WO ledger /
   # MTBF, PM-compliance tracking, daily recurrence sweep — mode-dispatched
   # inside YOUR CMMS. A pure connector: it reaches the CMMS as a TOOL and is
-  # inert until CMMS_MCP_URL is set (no template storage as system of record).
+  # inert until the vault connection 'cmms_mcp' exists (no template storage as
+  # system of record).
   # ─────────────────────────────────────────────────────────────────────────
   maintenance_records_agent:
     name: "maintenance_records_agent"
@@ -684,11 +701,13 @@ agents:
     # Work orders live in your CMMS, not this template. Point this connector at
     # an MCP gateway (Maximo, Fiix, eMaint) that receives `mode` (ingest_wo |
     # schedule_pm | report | pm_compliance | recurrence_sweep) and returns the
-    # yields below. Inert until CMMS_MCP_URL is set.
+    # yields below. The gateway's address + token are entered only in the vault:
+    # create the connection 'cmms_mcp' on Infrastructure → Integrations → MCP. Inert
+    # until it exists (no restart needed after).
     integration: "mcp"
     connector_config:
+      connection: cmms_mcp          # vault connection holds the address + token
       transport: "http"
-      url: "${CMMS_MCP_URL:}"
       tool_name: "get_maintenance_history"
       timeout: 30
     # wake_up: "0 7 * * *"   # daily recurrence sweep — enable (with a timezone)
@@ -792,6 +811,8 @@ agents:
       - intent: lifecycle_decision
         description: "The continue / overhaul / replace decision order."
         responsibility: |
+          keep-vs-replace ratio = the last 12 months' maintenance spend ÷
+          the replacement cost (both come from the dossier).
           Apply IN ORDER, do not deviate:
             1. age >= 1.2× design life AND keep-vs-replace ratio >= 0.25 → replace.
             2. age >= 1.0× design life AND >= 5 lifetime failures → overhaul.
@@ -858,7 +879,7 @@ agents:
       severity: "string"
       osha_recordable: "boolean"
       osha_report_window_hours: "number"
-      state_filings_required: "list"
+      state_filings_required: {type: array, items: string}
       requires_safety_manager_review: "boolean"
       requires_immediate_escalation: "boolean"
       recorded_at_utc: "string"

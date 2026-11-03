@@ -4,8 +4,8 @@ Four realistic scenarios that exercise the major paths through this pod.
 
 Day-0 note: the pod runs on the **seed dev store** (`agency/_shared/store.py`)
 with no connector wired — `read_condition_signals` and the RUL tools read the
-seed asset. Wire your historian (`HISTORIAN_MCP_URL` / `IIOT_MQTT_HOST`) and CMMS
-(`CMMS_MCP_URL`) for live data (see `configs/config.yaml`). `sensor_reading` now
+seed asset. Wire your historian (vault connections `historian_mcp` / `plant_iiot`)
+and CMMS (vault connection `cmms_mcp`) for live data (see `configs/config.yaml`). `sensor_reading` now
 enters through **Mira, the coordinator**, who opens the case and hands it to Rex.
 
 ## How to run
