@@ -47,7 +47,10 @@ deterministic risk score, forces the safety route in code, not in a prompt.
 **Wanda refuses to issue into a parts gap** and refuses to mint an untraceable
 work order. **Ivan re-checks that a human actually authorised** before it issues
 anything, and **deletes a half-issued pack** if its floor trips. **Silence never
-advances a work order** — every human gate default-denies to `held_for_review`.
+advances a work order**: if nobody answers a request in time, its Inbox card
+closes and the ticket records that no reply came. Nothing is issued on silence.
+A healthy asset (remaining life beyond the 30-day planning horizon, not
+safety-critical) gets no work order; its score is recorded in the audit trail.
 Routine work (planned/corrective with parts on hand) auto-issues and dispatches;
 a human is forced only on the irreversible or safety-critical decisions. Every
 terminal path lands in a hash-chained WORM ledger, so the reliability team can
@@ -56,11 +59,14 @@ avoided downtime, fewer emergency-freight parts orders, an auditable PM trail.
 
 ## Modern capabilities (SDK 2.4.131)
 
-- **`instances` (asset fan-out)** — Cass runs as **3 parallel copies** per fleet
+- **`scaling.copies` (asset fan-out)** — Cass runs as **3 parallel copies** per fleet
   sweep, each ATOMICALLY CLAIMING a disjoint asset (`claim_next_asset`) so copies
-  split the fleet instead of duplicating work.
+  split the fleet instead of duplicating work. (2.4.484's `copies.mode: auto` with
+  `claim_tool:` could replace this manual split — an owner decision, not done here.)
 - **`listen_events` (IIoT stream)** — Cass binds a live MQTT condition stream via
-  the top-level `plant_iiot` broker; inert until `IIOT_MQTT_HOST` is set.
+  the top-level `plant_iiot` broker. Off on day 0: create vault connection
+  `plant_iiot` (its URL), then uncomment the broker and `listen_events` (in
+  `configs/config.yaml` before the first start, in Studio's YAML editor after it).
 - **`timezone`** — every live `wake_up` (Cass's daily sweep, Perry's weekly
   forecast) sets a `timezone` so it fires in plant-local time, not UTC.
 - **`super_agent` (dict form)** — Rex runs the plan→execute→verify orchestrator
@@ -68,9 +74,10 @@ avoided downtime, fewer emergency-freight parts orders, an auditable PM trail.
 - **`playbook`** — the craft (RUL reading, safety policy, demand forecast,
   lifecycle decision order, OSHA taxonomy) lives in `responsibility`, loaded on
   demand; only the short `description` rides in the prompt.
-- **`mcp` (commented)** — the historian block ships commented (the SDK rejects an
-  empty-URL http mcp at load); day-0 the dev-store tools stand in and announce
-  `available:false` when there is no real source.
+- **`mcp` (commented)** — the historian block ships commented, picking the vault
+  connection `historian_mcp` (the address + token live only in the vault); day-0
+  the dev-store tools stand in and announce `available:false` when there is no
+  real source.
 
 ## Prerequisites — what to set, in three tiers
 
@@ -86,45 +93,60 @@ store.py`); condition reads, the IIoT stream, and CMMS use dev stand-ins that
 | `LEAFMESH_ENV_TOKEN` | Per-environment telemetry | **Required.** |
 | `OPENAI_API_KEY` | Every LLM agent (`gpt-4o-mini`) | **Required.** |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
-| `HITL_OUTBOUND_URL` | Where human members are notified | Defaults to a local stub. |
+| *(no setting)* — human members | Human approvals | Answer in Studio's Inbox. To notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |
 
-### Tier 2 — real systems of record (set the URL; connectors are inert until then)
+### Tier 2 — real systems of record (a vault connection each; inert until then)
+Addresses and tokens are entered **only in the vault** (Studio → Infrastructure →
+Integrations → MCP for the historian / CMMS servers, Infrastructure → Brokers &
+queues → MQTT for the `plant_iiot` broker) — the SDK refuses a `url:` / `token:` written in the config, even as
+`${ENV_VAR}`.
+
 | Setting | Enables |
 |---|---|
-| `HISTORIAN_MCP_URL` / `IIOT_MQTT_HOST` | Live condition reads + the IIoT stream (uncomment the `mcp` block) |
-| `CMMS_MCP_URL` | Live CMMS WO ledger / PM-compliance / recurrence sweep |
+| *(vault connection `historian_mcp`)* | Live condition reads — then uncomment Rex's (`failure_predictor_agent`) `mcp` block. The day-0 tools in `agency/tools.py` check this vault record themselves; nothing goes in `.env`. |
+| *(vault connection `plant_iiot`)* | The IIoT stream (uncomment the `plant_iiot` broker + Cass's `listen_events`) |
+| *(vault connection `cmms_mcp`)* | Live CMMS WO ledger / PM-compliance / recurrence sweep (`maintenance_records_agent` already picks it — no uncomment needed) |
 
-> ⚠️ The SDK rejects an `mcp` block with an **empty** URL at load, so the
-> historian block ships **commented** in `configs/config.yaml`. Fill the URL,
-> then uncomment. The `plant_iiot` broker is inert until `IIOT_MQTT_HOST` is set.
+> The historian `mcp` block and the `plant_iiot` broker ship **commented** in
+> `configs/config.yaml`, already naming their connections: create the
+> connection, then uncomment — in the file before the first start, in Studio's
+> YAML editor after it (applies live, no restart; see *Changing the configuration after the first start*).
 
 ### Tier 3 — escalation egress (optional)
 | Setting | Purpose |
 |---|---|
-| `PAGER_WEBHOOK` | Manager-escalation webhook (defaults to a PagerDuty enqueue URL) |
-| `SLACK_MAINT_CHANNEL` | `channel_id` for the manager-escalation Slack target |
+| *(vault connection `escalation_webhook`)* | Manager-escalation webhook (e.g. PagerDuty): create vault connection `escalation_webhook` (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook'), then uncomment the webhook target (in `configs/config.yaml` before the first start, in Studio's YAML editor after it) |
+| `SLACK_MAINT_CHANNEL` | `channel_id` for the manager-escalation Slack target, which ships **commented**: it needs a Slack adapter. Connect Slack on Infrastructure → Messaging → Slack (vault record, e.g. `slack_maint`), give `ops_manager_human` `channels: {slack: {connection: slack_maint}}`, set this value, then uncomment the target. |
 
 ## The team (13 members)
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
 | `mira_coordinator_agent` | Maintenance Coordinator | Owns the case end to end; opens it, keeps live status, is the reliability team's one contact | LLM; orchestrates Rex→Wanda→Ivan; routes exceptions to the engineer; **never reads a sensor or approves** |
-| `condition_sensor_agent` | Condition-Monitoring Engineer | Reads vibration/temp/current per asset, flags anomalies | Programmatic + **instances** (atomic-claim fleet fan-out) + **listen_events** (IIoT) + dev-store tools; on anomaly → Rex |
+| `condition_sensor_agent` | Condition-Monitoring Engineer | Reads vibration/temp/current per asset, flags anomalies | Programmatic + **scaling.copies** (atomic-claim fleet fan-out) + **listen_events** (IIoT) + dev-store tools; on anomaly → Rex |
 | `failure_predictor_agent` | Predictive Reliability Analyst | Scores RUL, failure mode, confidence; writes the engineer briefing | LLM + **super_agent** + **playbook** + telemetry tools; `@chain` **safety floors** (fail closed); → Wanda / engineer |
 | `work_order_scheduler_agent` | Maintenance Planner | Picks window + work type, runs the parts gate, sets priority; bounds re-work | Programmatic; `@pre_compose` parts + `@chain` priority floor; → issuer (routine) / engineer (review/gap) |
 | `work_order_issuer_agent` | Work-Order Issuer | Issues the approved pack, dispatches the technician, records the ledger | Programmatic **finisher**; auth re-check → invariants → render pack → **delete-on-block** → dispatch |
-| `reliability_engineer_human` | Reliability engineer (Human) | Reviews shutdown / parts-gap decisions; approves or holds | Human gate — approve → issuer; hold → audit |
-| `technician_human` | Maintenance technician (Human) | Does the repair; reports completed / parts_issue | Human gate — parts_issue → planner (bounded); completed → audit |
-| `ops_manager_human` | Ops manager (Human) | Production-impact tier: capex sign-off, safety escalations, held flows | Human gate — everything that leaves the pod |
+| `reliability_engineer_human` | Reliability engineer, on call (Human) | Reviews shutdown / parts-gap decisions; approves, rejects or holds | Human gate, **1h** (P1 on-call response) — approved → issuer; rejected / held_for_review → audit |
+| `technician_human` | Maintenance technician (Human) | Does the repair; reports completed / parts_issue | Human gate, **8h** (one shift) — parts_issue → planner (bounded); completed / held_for_review → audit |
+| `ops_manager_human` | Operations manager (Human) | Production-impact tier: capex sign-off, safety-incident escalations, critical parts shortages, PM-compliance misses | Human gate, **4h** (leaves time inside OSHA's 8h fatality window) — every answer → audit |
 | `maint_audit_logger_agent` | Compliance records custodian | Hash-chains every issue, dispatch, approval, hold, and forecast | External (custom sink); terminus |
 | `spare_parts_forecaster_agent` | Spare-Parts Demand Planner | 30/60/90-day parts forecast; critical shortages + overstock | LLM + **playbook**, weekly cron + **timezone**; `@chain` stockout floor; → ops manager |
 | `maintenance_records_agent` | Maintenance Records Analyst | WO ledger/MTBF, PM-compliance, recurrence sweep (CMMS) | Programmatic + MCP connector; → engineer / ops manager |
 | `equipment_lifecycle_agent` | Asset Lifecycle Planner | Continue / overhaul / replace scoring | LLM + **playbook**; `@pre_compose` dossier + `@chain` decision floor; → ops manager / planner |
 | `safety_incident_reporter_agent` | EHS / Safety Compliance Officer | OSHA severity + statutory filing windows | LLM + **playbook** + OSHA tables; `@chain` severity floor; → ops manager |
 
-The **LeafMesh Manager** supervises — it reads every hand-off and escalates
-stalls / repeated errors / gate timeouts to the Ops Manager automatically. It is
-a supervisor, not a router in the middle of the team.
+The **LeafMesh Manager** supervises; it is not a router in the middle of the
+team. It escalates to the Ops Manager on a non-retryable error (auth, a bad
+request, credit, bad config), when 3 different agents fail in one case, or when
+restarts run out. A malformed hand-off only raises an alert.
+
+**If nobody answers.** Each human request waits for the time in the table above.
+If nobody answers within it, the request waits no longer: its Inbox card closes
+and the ticket records that no reply came. Nothing is issued, dispatched or
+approved on silence, and nobody is chased automatically. (Each seat's
+`fallback_response` — `held_for_review` → audit — states the intended
+default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
 
 ## The deterministic floors (LLM-unwaivable)
 
@@ -139,21 +161,26 @@ a supervisor, not a router in the middle of the team.
 - **Issuance floor** (`work_order_issuer`, `@chain`): issue ONLY on an explicit
   authorisation + parts on hand + a traceable WO; else block and delete the partial.
 - **Lifecycle decision floor** (`equipment_lifecycle`, `@chain`): past design life +
-  over the replace threshold forces at least an overhaul.
+  the last 12 months' maintenance spend at ≥ 25% of the replacement cost forces at
+  least an overhaul.
 - **OSHA windows** (`safety_incident_reporter`, `@chain`): 8h / 24h / 7-day
   statutory deadlines are Python tables, never hallucinated.
 
 Plus: bounded re-work back-edge (technician `parts_issue` → planner, counter →
-engineer at the cap); every human gate **default-denies on timeout**; every
-terminal path lands in the hash-chained WORM audit.
+engineer after 3 rounds); nothing is issued on silence; every answer a person
+can give has a route, and every terminal path lands in the hash-chained WORM
+audit.
 
 ## Run it day-0 (no connectors)
 
-The seeded dev store ships a realistic fleet — `extruder-7` (past design life,
-safety-critical, vibration in ISO 10816 zone D), a nominal pump and conveyor, an
-anomalous reading, and a parts inventory where the replacement bearing's 72h lead
-time exceeds the RUL — so the failure floor, the safety hard-stop, and the parts
-gate all fire on the demo asset before any connector is wired.
+The seeded dev store ships a realistic fleet — `extruder-7` (11 years old on a
+10-year design life, safety-critical, vibration in ISO 10816 zone D, $480k to
+replace, $152.8k of maintenance in the last 12 months), a nominal pump and
+conveyor, and a parts inventory where the replacement bearing (`brg-sph-22320`)
+is out of stock with a 72h lead time — longer than the RUL — so the failure
+floor, the safety hard-stop, the parts gate and the lifecycle floor all fire on
+the demo asset before any connector is wired. The three bearing work orders in
+the CMMS history are the same ones the parts-issue ledger draws against.
 
 ```bash
 pip install -r requirements.txt          # core LeafMesh runs the pod day-0
@@ -173,12 +200,15 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
        "data":{"asset_id":"extruder-7","message":"vibration spike on the extruder"}}'
 ```
 
-On approval, Ivan renders the approved work-order pack to `./out/` and appends
+Any approval the case needs (technician, reliability engineer, ops manager)
+lands in **Studio → Inbox** — answer it there. On approval, Ivan renders the approved work-order pack to `./out/` and appends
 `./data/wo_ledger.json`; every terminal path hash-chains into
 `./logs/maint_audit.jsonl`.
 
 > Packaging note: `pip install leafmesh` (core) includes all LLM providers and
-> runs the pod. For real connectors add `leafmesh[mcp]`. Avoid `leafmesh[all]` on
+> runs the pod. For real connectors add the extra each one names at start-up:
+> `leafmesh[mcp]` (historian / CMMS), `leafmesh[mqtt]` (the `plant_iiot` stream),
+> `leafmesh[slack]` (the Slack escalation target). Avoid `leafmesh[all]` on
 > Python 3.12+ (it pulls `cchardet`, which has no wheel) — add only the extras you
 > need.
 
@@ -186,3 +216,108 @@ On approval, Ivan renders the approved work-order pack to `./out/` and appends
 
 *Built with `create-leafmesh`. The config is the department; the PRD is the brief.*
 *Design doctrine: `.claude/skills/leafmesh/building-agents-thoroughly.md`.*
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Changing a running project (Docker)
+
+What reaches a project that is already running (leafmesh 2.4.497). The
+image holds the Python code and the first-start `configs/config.yaml`;
+`.env` is passed in when the container is created; the store (Redis) keeps
+its data on its own volume.
+
+| You change | When it applies |
+|---|---|
+| An agent in Studio (prompt, model, tools, routes, human seats, schedules, …) | At once, no restart |
+| A human seat's `channels` (Slack, email, …) | The agency reloads itself in place within seconds |
+| Add or delete an agent in Studio | At once, including routes and schedules |
+| A connection in the vault (model keys, MCP, webhooks, connectors, Slack, email) | At once. An agent switched off for a missing connection or address switches back on by itself |
+| Anything in `.env` (licence, agency name, store, ports) | After `docker compose up -d` (the container is recreated) |
+| Python code (`agency/*.py`: programmatic agents, tools, `@pre_compose`) | After a rebuild: `docker compose up -d --build` |
+| `configs/config.yaml` | Never after the first start. It is read only when the store is empty |
+| Several app containers on one store | A Studio save reaches every one within about 15 seconds |
+
+- Keep model keys in the vault. A key there wins over the same key in
+  `.env` (the log warns), and a change applies at once. From 2.4.497 that
+  holds for every value the vault holds (endpoints, organisation / project
+  ids, cloud identities); the `.env` value returns when the record goes.
+- Code the image does not have: an agent marked pure Python
+  (`integration: python`) is switched off until its function is in the image;
+  any other programmatic agent stays on, and each call to code it does not
+  have fails. Rebuild the image with the code first.
+- A new Redis volume is an empty store, so `configs/config.yaml` is imported
+  again as version 1.
+- **If the agency refuses to start after an upgrade** (a new leafmesh pin,
+  then a rebuild: "Configuration has N error(s) in the stored
+  configuration"), repair the stored configuration with the agency stopped:
+
+  ```bash
+  docker compose run --rm predictive-maintenance leafmesh config check      # each problem, with its line
+  docker compose run --rm predictive-maintenance leafmesh config versions   # kept versions: which pass, which is in use
+  docker compose run --rm predictive-maintenance leafmesh config rollback   # back to the newest version that passes (saved as a new version)
+  ```
+
+  Or `leafmesh config export > config.yaml`, fix it by hand, then
+  `leafmesh config import config.yaml` (it is checked before it is saved).
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## This mesh's sign-in (leafmesh 2.4.497)
+
+From leafmesh 2.4.497 each mesh signs in to LeafCraft with its own key, not
+a key shared by every install.
+
+- **First start.** The mesh makes a key pair and registers it with
+  `LEAFMESH_LICENSE_KEY` and `LEAFMESH_ENV_TOKEN` from `.env` (copy the
+  environment token from Studio — a placeholder such as `development` is
+  refused). With both valid it works at once. If your organisation turned on
+  "require approval", the first start stops and says so: approve it in
+  Studio → **Keys → SDK access**, then start again. Organisation admins get an
+  email for every new registration.
+- **Where the key lives.** In the vault, in the store, encrypted with
+  `LEAFMESH_VAULT_KEY`: it survives rebuilds and every copy of the app shares
+  it. A new Redis volume, or a new vault key, makes a new key pair that
+  registers again — revoke the old one in Studio.
+- **Check or change it** (in Docker: `docker compose run --rm predictive-maintenance leafmesh auth status`):
+  - `leafmesh auth status` — credential id, key fingerprint, registration and
+    mode, never a key; `--check` signs in now and reports the tokens.
+  - `leafmesh auth register` — register now.
+  - `leafmesh auth rotate` — a new key pair: once it is active the mesh
+    switches to it and revokes the old one. A revoked or expired key is never
+    revived; rotate instead.
+- **Lost the environment token?** From 5 Dec 2026 Studio shows the licence
+  key and environment token only once, when they are made (then only a hint).
+  Rotate the environment token in Studio and put the new one in `.env`.
+  Rotating it changes where the agency's data is kept in the store, so do it
+  before the agency holds data.
+- **An existing project whose `.env` says `LEAFMESH_ENV_TOKEN=development`.**
+  2.4.497 needs the real token. The token also names where the agency's data
+  sits in the store, so with the real token the agency starts on an empty
+  store (vault, sessions, board) — the old data stays under the old name. Set
+  the real token before you put data in the agency, or contact us to move it.
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).
