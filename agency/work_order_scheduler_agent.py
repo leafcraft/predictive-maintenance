@@ -25,7 +25,7 @@ deterministic policy that must not be hallucinated:
   @chain set_priority — the work-order PRIORITY floor: P1 emergency / P2
      corrective / P3 planned; a safety/emergency job is always at least P1.
 
-All routing lives in configs/config.yaml `can_call`; this module computes the
+All routing lives in the configuration's `can_call`; this module computes the
 yields those wires evaluate.
 """
 from __future__ import annotations
