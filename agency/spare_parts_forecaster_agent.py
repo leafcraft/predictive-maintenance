@@ -18,7 +18,7 @@
 WHY THIS MODULE EXISTS (was pure-YAML): grounding the forecast in real
 consumption (@pre_compose) and a non-waivable shortage floor (@chain) is
 the depth bar — the prompt alone can't guarantee a known stockout surfaces.
-The weekly cron (configs/config.yaml `wake_up`) is unchanged.
+The weekly cron (the `wake_up` in the configuration) is unchanged.
 """
 from __future__ import annotations
 

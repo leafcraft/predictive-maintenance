@@ -3,7 +3,7 @@
 The PROACTIVE reader. Two live trigger surfaces fan it across the fleet:
   * `wake_up` — a scheduled PM sweep, and
   * `listen_events` — a live IIoT condition stream,
-each multiplied by `instances: 3` into parallel copies. Every copy ATOMICALLY
+each multiplied by `scaling.copies.count: 3` into parallel copies. Every copy ATOMICALLY
 CLAIMS the next asset from the inspection backlog (store.claim_next_asset) so the
 copies split the fleet instead of re-reading the same asset — the merge would
 otherwise honestly show duplicated work. A copy that claims a specific asset

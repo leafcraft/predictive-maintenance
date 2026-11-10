@@ -2,7 +2,7 @@
 
 A pod (coordinator + specialists + a finisher + human members + the Manager
 supervisor) that runs an asset from a condition signal to an issued, audited work
-order. Not a pipeline: every wire is conditional, every human gate default-denies,
+order. Not a pipeline: every wire is conditional, nothing is issued on silence,
 the finisher produces the real artifact and fails closed, and the WORM sink is the
 terminus. Systems (historian / CMMS / ERP-MRP) are TOOLS inside agents, never
 members.
@@ -43,10 +43,10 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
   `safety_incident_reporter_agent`, `maintenance_records_agent`.
 - **Finisher** — `work_order_issuer_agent` (behind the human gate: auth re-check →
   invariants → render pack → delete-on-block → dispatch → ledger).
-- **Human members** — reliability engineer, technician, ops manager (first-class,
-  webhook/dual, default-deny).
-- **Supervisor** — the LeafMesh Manager (static routing; escalates stalls / errors /
-  timeouts to the ops manager).
+- **Human members** — reliability engineer (on call, 1h), technician (8h shift),
+  ops manager (4h); first-class, Inbox, dual. Nothing is issued on silence.
+- **Supervisor** — the LeafMesh Manager (static routing; escalates non-retryable
+  errors, 3 failed agents in one case, or exhausted restarts to the ops manager).
 - **WORM sink** — `maint_audit_logger_agent` (hash-chained, terminal on every branch).
 
 ## Flow
@@ -56,8 +56,8 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
         │ action==open_case                         │ action==escalate
         ▼                                           ▼
  failure_predictor_agent                    reliability_engineer_human
-   │  (safety floors @chain)                       │ approved        │ held
-   │ predicted_failure_hours>=0                    ▼                 ▼
+   │  (safety floors @chain)                       │ approved        │ rejected/held
+   │ RUL<720h (≥720h & safe → audit)               ▼                 ▼
    │                          ┌──── work_order_issuer_agent    maint_audit_logger_agent
    │ safety/low-conf          │        │ dispatched_to==technician
    ▼                          │        ▼
@@ -67,7 +67,7 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
  work_order_scheduler_agent ◀─┴── (re-work)              maint_audit_logger_agent
    │ parts_available && !review && !exhausted ─▶ work_order_issuer_agent
 
- scheduled_inspection (cron 0 6, tz) ─▶ condition_sensor_agent (instances:3, atomic claim) ─anomaly─▶ Rex
+ scheduled_inspection (cron 0 6, tz) ─▶ condition_sensor_agent (copies.count:3, atomic claim) ─anomaly─▶ Rex
  plant_iiot MQTT stream (listen_events) ─▶ condition_sensor_agent
  weekly_parts_forecast (cron 0 8 mon, tz) ─▶ spare_parts_forecaster_agent ─▶ ops_manager (shortages) / audit
  equipment_lifecycle_assess ─▶ equipment_lifecycle_agent ─▶ ops_manager (replace) / scheduler (overhaul)
@@ -76,34 +76,37 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
  shutdown_request / engineer_reply ─▶ reliability_engineer_human
 ```
 
-Human-to-human escalation is the Manager supervisor's job (no dual→dual human
-wires). All human gates default-deny to `held_for_review`; every terminal branch
-lands in `maint_audit_logger_agent`.
+No dual→dual human wires. A request nobody answers is not escalated: its Inbox
+card closes and the ticket records that no reply came (the seats'
+`fallback_response` — `held_for_review` → audit — is declared, and leafmesh
+2.4.486 does not route it for dual seats yet). Every terminal branch lands in
+`maint_audit_logger_agent`.
 
 ## Modern capabilities (SDK 2.4.131)
 
-- **`instances: 3` + atomic claim** (`condition_sensor_agent`) — a fleet sweep /
+- **`scaling.copies.count: 3` + atomic claim** (`condition_sensor_agent`) — a fleet sweep /
   stream fans into 3 parallel copies, each `store.claim_next_asset()` (also the
-  `claim_next_asset` global tool) pops a disjoint asset. `instances_handoff: each`
+  `claim_next_asset` global tool) pops a disjoint asset. `scaling.copies.handoff: each`
   so each anomalous asset routes its own prediction.
 - **`listen_events`** (`condition_sensor_agent`) — binds an MQTT condition stream
-  via the top-level `plant_iiot` broker; inert until `IIOT_MQTT_HOST`.
+  via the top-level `plant_iiot` broker; off on day 0 (create vault connection
+  `plant_iiot`, then uncomment the broker and `listen_events` — in Studio's raw YAML editor; no restart).
 - **`timezone`** — on both live crons (Cass daily, Perry weekly) so they fire in
   plant-local time, not UTC.
 - **`super_agent` (dict form)** (`failure_predictor_agent`) — plan→execute→verify
   over telemetry; `cost_ceiling` + `wall_clock` tuned via the dict (the only path).
 - **`playbook`** (Rex, Perry, Ellis, Sana) — craft in `responsibility`, loaded on
   demand; only `description` in the prompt.
-- **`mcp` (commented)** — the historian block on Cass ships commented (empty-URL
-  http mcp is rejected at load); day-0 dev tools stand in and announce
-  `available:false`.
+- **`mcp` (commented)** — the historian block on Rex ships commented, picking the
+  vault connection `historian_mcp` (address + token live only in the vault); day-0
+  dev tools stand in and announce `available:false`.
 
 ## Actor inventory
 
 | Agent | Job title | Type |
 |---|---|---|
 | `mira_coordinator_agent` | Maintenance coordinator | llm |
-| `condition_sensor_agent` | Condition-monitoring engineer | programmatic + module (instances / listen_events) |
+| `condition_sensor_agent` | Condition-monitoring engineer | programmatic + module (scaling.copies / listen_events) |
 | `failure_predictor_agent` | Predictive reliability analyst | llm + super_agent + module (@chain floors) |
 | `work_order_scheduler_agent` | Maintenance planner | programmatic + module (@pre_compose / @chain) |
 | `work_order_issuer_agent` | Work-order issuer (finisher) | programmatic + module (@chain issuance floor) |
@@ -168,9 +171,12 @@ lands in `maint_audit_logger_agent`.
 - **`safety_incident_reporter_agent`** — llm + `agency/safety_incident_reporter_agent.py`
   (OSHA 8h/24h/7-day tables). `@pre_compose load_incident_context`;
   `@chain enforce_severity_floor` maps outcome → mandated severity/route. → ops_manager.
-- **`maintenance_records_agent`** — programmatic; `${CMMS_MCP_URL}` tool
-  `get_maintenance_history`, mode-dispatched. Inert until wired. → engineer / ops_manager.
-- **Humans** — webhook/dual, `fallback_on_timeout` → `held_for_review` → audit.
+- **`maintenance_records_agent`** — programmatic; vault connection `cmms_mcp`, tool
+  `get_maintenance_history`, mode-dispatched. Inert until that connection exists. → engineer / ops_manager.
+- **Humans** — Studio Inbox, dual. Engineer: approved → issuer; rejected /
+  held_for_review → audit. Technician: parts_issue → planner; completed /
+  held_for_review → audit. Ops manager: every answer → audit. A timeout closes
+  the card and records that no reply came; nothing routes on silence.
 - **`maint_audit_logger_agent`** — external/custom, registered via
   `sdk.intelligence("maint_audit_logger_agent")` in `main.py`; hash-chained WORM.
 
@@ -192,18 +198,19 @@ lands in `maint_audit_logger_agent`.
 - Lifecycle decision floor + OSHA statutory windows (Python, not LLM).
 - Traceability (scheduler): refuses an untraceable work order.
 - Bounded re-work back-edge (technician `parts_issue` → planner, counter → engineer).
-- Human gates: default-deny on timeout; Manager supervisor escalates human→human.
+- Human gates: nothing issued on silence; every answer value has a route.
 - WORM audit: hash-chained, terminal on every branch.
 
 ## Dev store (day-0, no connectors)
 
 `agency/_shared/store.py` stands in for the historian / CMMS / parts master so the
 FULL chain runs end-to-end before any connector is wired. Seeded with a
-safety-critical asset (`extruder-7`, past design life, ISO 10816 zone D), a nominal
-pump + conveyor (so `instances: 3` claims three disjoint assets per sweep), an
-anomalous reading + telemetry series, a parts inventory where the bearing is out of
-stock (72h lead > RUL), recurring corrective records, and an open work order for
-`parts_arrived` re-entry. It holds the domain math the floors read
+safety-critical asset (`extruder-7`, past design life, ISO 10816 zone D, $480k
+replacement cost, $152.8k trailing-12-month maintenance), a nominal pump + conveyor
+(so `scaling.copies.count: 3` claims three disjoint assets per sweep), an anomalous
+reading + telemetry series, a parts inventory where the bearing `brg-sph-22320` is
+out of stock (72h lead > RUL), recurring corrective records whose work-order ids
+match the parts-issue ledger, and an open work order for `parts_arrived` re-entry. It holds the domain math the floors read
 (`failure_probability()`, `parts_availability()`, `parts_demand_signals()`), the
 atomic fleet backlog (`claim_next_asset()`), and the issuer's outbox + ledger +
 pending-WO recovery. `agency/tools.py` is the day-0 `@global_tool` surface; each
@@ -213,9 +220,10 @@ read for the matching MCP connector; the function signatures are the contract.
 
 ## Config pointer
 
-The department is `configs/config.yaml`. Python exists for the reader, the actuator
+The department is the agency's configuration (`create-leafmesh --start` loads
+it into the store once; after that it is changed in Studio). Python exists for the reader, the actuator
 + finisher, the self-reliant LLMs, the OSHA tables, the dev store + tools + session
-stash, and the WORM sink. Validate with `python validate_config.py`; unit-test the
+stash, and the WORM sink. Validate with `leafmesh config check`; unit-test the
 floors + finisher with `python -m pytest`.
 
 ## Reflection / decisions
@@ -229,5 +237,5 @@ floors + finisher with `python -m pytest`.
   fire on post-floor values (belt-and-braces).
 - **State stays in the customer's systems** via connectors; the dev store + WORM
   file are dev stand-ins, never systems of record.
-- **No dual→dual human edges** — the SDK warns on them; human→human escalation is
-  the Manager supervisor's job.
+- **No dual→dual human edges** — the SDK warns on them. Silence on a gate is not
+  escalated to the next tier on leafmesh 2.4.486 (see the README).

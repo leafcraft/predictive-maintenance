@@ -1,18 +1,19 @@
 """predictive-maintenance — Predictive-Maintenance Pod (LeafMesh).
 
 Boot order matters (SDK 2.4.131):
-  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_store/start,
      so Cass's claim_next_asset / read_condition_signals and Rex's telemetry tools
      are registered.
-  2. LeafMesh.from_yaml(...) → auto_discover wires agency/*_agent.py to the YAML.
+  2. LeafMesh.from_store() → auto_discover wires agency/*_agent.py to the YAML.
   3. audit_logger.register(...) → attach the WORM sink to the custom external
-     maint_audit_logger_agent (after from_yaml, before start).
+     maint_audit_logger_agent (after from_store, before start).
   4. leafmesh.start().
 
-YAML-first: the mesh is defined in configs/config.yaml. Sensor data comes from
-your plant historian (HISTORIAN_MCP_URL / plant_iiot broker) and work orders live
-in your CMMS (CMMS_MCP_URL) via connectors; day-0 the pod runs on the seed dev
-store with no connector wired.
+YAML-first: the mesh is defined in the agency's configuration (in the store;
+see Studio). Sensor data comes from
+your plant historian (vault records 'historian_mcp' / 'plant_iiot') and work
+orders live in your CMMS (vault record 'cmms_mcp') via connectors; day-0 the pod
+runs on the seed dev store with no connector wired.
 """
 import asyncio
 import signal
@@ -26,7 +27,7 @@ from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external maint_audit_logger_agent (SDK 2.4+ API).
@@ -52,10 +53,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.MANAGER_INTERVENTION,  _on_manager_intervention)
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     logger.info("predictive-maintenance — Predictive Maintenance mesh running")
 

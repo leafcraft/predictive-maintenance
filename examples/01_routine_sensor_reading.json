@@ -1,13 +1,13 @@
 {
   "_entry_point": "sensor_reading",
-  "_description": "Normal-band IIoT reading \u2014 Mira (coordinator) opens the case and hands it to Rex, who scores the asset healthy; no anomaly, no work order, no downstream gate fires.",
+  "_description": "Normal-band IIoT reading on the seeded feedwater pump \u2014 Mira (coordinator) opens the case and hands it to Rex, who scores the asset healthy; no anomaly, no work order, no downstream gate fires.",
   "payload": {
-    "asset_id": "pump-103-coolant",
+    "asset_id": "pump-107-feedwater",
     "asset_type": "centrifugal_pump",
     "reading": {
-      "vibration_rms_mm_s": 1.8,
+      "vibration_rms_mm_s": 2.6,
       "temp_c": 62,
-      "current_a": 14.2,
+      "current_a": 17.8,
       "anomaly": false
     },
     "ts_utc": "2026-06-04T14:00:00Z"

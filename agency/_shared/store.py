@@ -11,10 +11,10 @@ end-to-end before any connector is wired:
 Replace each read with the matching MCP connector in prod; the function
 signatures are the contract. The integration points (do nothing until
 the calls here are wired):
-  * HISTORIAN_MCP_URL → signal_series() / latest_reading()   (failure_predictor_agent)
-  * CMMS_MCP_URL      → asset_history() / open_work_orders()  (maintenance_records_agent, scheduler)
-  * (parts master)    → part_for_failure_mode() / on_hand()  (work_order_scheduler_agent)
-Setting those env vars alone does nothing until you wire the calls here.
+  * vault record 'historian_mcp' → signal_series() / latest_reading()   (failure_predictor_agent)
+  * vault record 'cmms_mcp'      → asset_history() / open_work_order()  (maintenance_records_agent, scheduler)
+  * (parts master)               → parts_for_failure_mode() / part()    (work_order_scheduler_agent)
+Creating those vault records alone does nothing here until you wire the calls.
 
 Single-process JSON files under ./data — survives the HITL wait because
 the mesh is one process. Swap for the Redis/Postgres session store at
@@ -78,7 +78,7 @@ _SEED_ASSETS = {
         "criticality": "safety_critical",     # leak / fire / pinch hazard on failure
         "installed_utc": _days(-365 * 11),     # 11 years old
         "design_life_years": 10,               # past design life
-        "replacement_cost_cents": 9_000_000,   # $90k to replace
+        "replacement_cost_cents": 48_000_000,  # $480k — 150 mm single-screw line, installed
         "warranty_expires_utc": _days(-400),
         "line_id": "LINE-2",
     },
@@ -91,14 +91,14 @@ _SEED_ASSETS = {
         "warranty_expires_utc": _days(120),
         "line_id": "LINE-1",
     },
-    # A third fleet asset so the scheduled fan-out (instances: 3) claims three
+    # A third fleet asset so the scheduled fan-out (scaling.copies.count: 3) claims three
     # DISJOINT assets per sweep — a nominal conveyor (clean-pass control).
     "conveyor-3": {
         "asset_id": "conveyor-3", "asset_type": "belt_conveyor",
         "criticality": "standard",
         "installed_utc": _days(-365 * 2),      # 2 years old
         "design_life_years": 12,
-        "replacement_cost_cents": 900_000,     # $9k
+        "replacement_cost_cents": 3_800_000,   # $38k — drive, belt, idlers
         "warranty_expires_utc": _days(300),
         "line_id": "LINE-2",
     },
@@ -161,25 +161,27 @@ _SEED_READINGS = {
 
 # ── Seed: spare-parts inventory keyed by part SKU ────────────────────
 # The bearing that fixes extruder-7's bearing_wear is OUT of stock with a
-# 72h lead time — longer than the RUL — so the parts gate fires.
+# 72h (expedited) lead time — longer than the RUL — so the parts gate fires.
+# lead_time_hours is the supplier's replenishment lead time; it only blocks a
+# work order when the part is NOT on hand.
 _SEED_PARTS = {
-    "bearing-skf-22320": {
-        "part_sku": "bearing-skf-22320", "description": "Spherical roller bearing",
+    "brg-sph-22320": {
+        "part_sku": "brg-sph-22320", "description": "Spherical roller bearing 22320, 100x215x73 mm",
         "on_hand": 0, "lead_time_hours": 72.0, "unit_cost_cents": 84_000,
     },
     "seal-kit-ext7": {
         "part_sku": "seal-kit-ext7", "description": "Extruder mechanical seal kit",
-        "on_hand": 3, "lead_time_hours": 0.0, "unit_cost_cents": 21_000,
+        "on_hand": 3, "lead_time_hours": 336.0, "unit_cost_cents": 21_000,
     },
     "pump-impeller-107": {
         "part_sku": "pump-impeller-107", "description": "Feedwater pump impeller",
-        "on_hand": 2, "lead_time_hours": 0.0, "unit_cost_cents": 46_000,
+        "on_hand": 2, "lead_time_hours": 504.0, "unit_cost_cents": 46_000,
     },
 }
 
 # Failure-mode → the part(s) needed to repair it.
 _SEED_FAILURE_PART_MAP = {
-    "bearing_wear": ["bearing-skf-22320"],
+    "bearing_wear": ["brg-sph-22320"],
     "seal_leak": ["seal-kit-ext7"],
     "impeller_erosion": ["pump-impeller-107"],
 }
@@ -191,7 +193,7 @@ _SEED_FAILURE_PART_MAP = {
 # rising clip (3 draws in 90d) on the degrading extruder; the seal kit and
 # impeller are slow movers (capital tied up → overstock candidates).
 _SEED_PARTS_USAGE = {
-    "bearing-skf-22320": [
+    "brg-sph-22320": [
         {"issued_at_utc": _days(-78), "qty": 1, "work_order_id": "wo-ext7-h1", "asset_id": "extruder-7"},
         {"issued_at_utc": _days(-41), "qty": 1, "work_order_id": "wo-ext7-h2", "asset_id": "extruder-7"},
         {"issued_at_utc": _days(-9),  "qty": 1, "work_order_id": "wo-ext7-h3", "asset_id": "extruder-7"},
@@ -204,25 +206,45 @@ _SEED_PARTS_USAGE = {
 
 # ── Seed: CMMS maintenance records + open work orders ────────────────
 _SEED_RECORDS = {
-    # Heavy, recurring corrective spend on an 11-year-old extruder — the
-    # cost-to-keep has crept past the replace threshold (the lifecycle
-    # floor's whole point). Costs in cents; ~$2.5M lifetime upkeep on a
-    # $90k-to-replace asset → keep-vs-replace ratio well over 0.25.
+    # Recurring corrective spend on an 11-year-old extruder. The three bearing
+    # jobs are the same work orders the parts-issue ledger above draws the
+    # bearings against (wo-ext7-h1/h2/h3) — the two systems reconcile. Costs in
+    # cents (parts + labour + contractor; lost production is NOT in a CMMS cost).
+    # Trailing 12 months: 18.6k + 21.4k + 24.9k + 46.2k + 3.2k + 38.5k = $152.8k
+    # on a $480k asset → cost-to-keep ratio 0.318, over the 0.25 replace line.
+    # The 2-year-old screw/barrel refurbishment is outside that window.
     "extruder-7": [
-        {"wo_kind": "corrective", "opened_at_utc": _days(-22), "closed_at_utc": _days(-22),
-         "cost_cents": 6_400_000, "root_cause": "bearing_wear", "downtime_mins": 240},
-        {"wo_kind": "corrective", "opened_at_utc": _days(-12), "closed_at_utc": _days(-12),
-         "cost_cents": 5_800_000, "root_cause": "bearing_wear", "downtime_mins": 180},
-        {"wo_kind": "corrective", "opened_at_utc": _days(-3), "closed_at_utc": _days(-3),
-         "cost_cents": 7_100_000, "root_cause": "vibration_alarm", "downtime_mins": 300},
-        {"wo_kind": "emergency", "opened_at_utc": _days(-200), "closed_at_utc": _days(-199),
-         "cost_cents": 8_900_000, "root_cause": "seal_leak", "downtime_mins": 720},
-        {"wo_kind": "planned", "opened_at_utc": _days(-60), "closed_at_utc": _days(-60),
-         "cost_cents": 1_200_000, "root_cause": "pm_lubrication", "downtime_mins": 60},
+        {"work_order_id": "wo-ext7-h1", "wo_kind": "corrective", "opened_at_utc": _days(-78),
+         "closed_at_utc": _days(-78), "cost_cents": 1_860_000, "root_cause": "bearing_wear",
+         "downtime_mins": 240},
+        {"work_order_id": "wo-ext7-h2", "wo_kind": "corrective", "opened_at_utc": _days(-41),
+         "closed_at_utc": _days(-41), "cost_cents": 2_140_000, "root_cause": "bearing_wear",
+         "downtime_mins": 180},
+        {"work_order_id": "wo-ext7-h3", "wo_kind": "corrective", "opened_at_utc": _days(-9),
+         "closed_at_utc": _days(-9), "cost_cents": 2_490_000, "root_cause": "bearing_wear",
+         "downtime_mins": 300},
+        {"work_order_id": "wo-ext7-h0", "wo_kind": "emergency", "opened_at_utc": _days(-200),
+         "closed_at_utc": _days(-199), "cost_cents": 4_620_000, "root_cause": "seal_leak",
+         "downtime_mins": 720},
+        {"work_order_id": "wo-ext7-pm14", "wo_kind": "planned", "opened_at_utc": _days(-60),
+         "closed_at_utc": _days(-60), "cost_cents": 320_000, "root_cause": "pm_lubrication",
+         "downtime_mins": 60},
+        {"work_order_id": "wo-ext7-g1", "wo_kind": "corrective", "opened_at_utc": _days(-300),
+         "closed_at_utc": _days(-299), "cost_cents": 3_850_000, "root_cause": "gearbox_misalignment",
+         "downtime_mins": 480},
+        {"work_order_id": "wo-ext7-rf2", "wo_kind": "planned", "opened_at_utc": _days(-700),
+         "closed_at_utc": _days(-696), "cost_cents": 6_200_000, "root_cause": "screw_barrel_refurbishment",
+         "downtime_mins": 2880},
     ],
     "pump-107-feedwater": [
-        {"wo_kind": "planned", "opened_at_utc": _days(-90), "closed_at_utc": _days(-90),
-         "cost_cents": 8_000, "root_cause": "pm_inspection", "downtime_mins": 45},
+        {"work_order_id": "wo-p107-pm08", "wo_kind": "planned", "opened_at_utc": _days(-90),
+         "closed_at_utc": _days(-90), "cost_cents": 48_000, "root_cause": "pm_inspection",
+         "downtime_mins": 45},
+    ],
+    "conveyor-3": [
+        {"work_order_id": "wo-cv3-pm05", "wo_kind": "planned", "opened_at_utc": _days(-30),
+         "closed_at_utc": _days(-30), "cost_cents": 36_000, "root_cause": "pm_belt_tracking",
+         "downtime_mins": 30},
     ],
 }
 
@@ -388,7 +410,7 @@ def read_condition_signals(asset_id: str) -> dict[str, Any]:
     r = latest_reading(asset_id)
     if not r:
         return {"available": False, "asset_id": asset_id,
-                "reason": f"no seed reading for {asset_id!r}; wire HISTORIAN_MCP_URL"}
+                "reason": f"no seed reading for {asset_id!r}; create vault record 'historian_mcp' and wire the historian read"}
     summary = {
         "vibration_rms_mm_s": r.get("vibration_rms_mm_s"),
         "vibration_baseline_mm_s": r.get("vibration_baseline_mm_s"),
@@ -405,7 +427,7 @@ def read_condition_signals(asset_id: str) -> dict[str, Any]:
             "anomaly_detected": bool(r.get("anomaly_detected"))}
 
 
-# ── Fleet inspection backlog + ATOMIC claim (drives instances fan-out) ────
+# ── Fleet inspection backlog + ATOMIC claim (drives scaling.copies fan-out) ────
 def _fleet_backlog() -> list[str]:
     """The queue of assets due for a condition sweep. In prod this is your
     'due-for-inspection' query; the dev store reseeds from the asset master
