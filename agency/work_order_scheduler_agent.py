@@ -1,7 +1,7 @@
 """work_order_scheduler_agent — Wanda, the maintenance planner.
 
 Plans a work order; it deliberately does NOT dispatch — the planner is not the
-issuer (a second pass, behind the human gate, actuates). Four pieces are
+issuer (a second pass, behind the human step, actuates). Four pieces are
 deterministic policy that must not be hallucinated:
 
   @pre_compose load_parts — the planner pulls its OWN parts picture (on-hand +
@@ -20,7 +20,7 @@ deterministic policy that must not be hallucinated:
      rounds are COUNTED per work order and, past the bound, rework_exhausted is
      tripped so the loop terminates at the engineer instead of ping-ponging.
      The planned work order is stashed so the issuer can recover it across the
-     human gate.
+     human step.
 
   @chain set_priority — the work-order PRIORITY floor: P1 emergency / P2
      corrective / P3 planned; a safety/emergency job is always at least P1.
@@ -222,6 +222,6 @@ async def work_order_scheduler_agent(llm_response, input_data, context):
         "rework_rounds": rework_rounds, "rework_exhausted": rework_exhausted,
     }
 
-    # Stash the plan so the issuer can recover it across the human gate.
+    # Stash the plan so the issuer can recover it across the human step.
     store.put_pending_wo(wo_id, plan)
     return plan

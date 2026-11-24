@@ -454,7 +454,7 @@ def claim_next_asset() -> dict[str, Any]:
 # ── Issuer recovery + outbox + append-only ledger (dev mirror of the WORM) ──
 def put_pending_wo(work_order_id: str, wo: dict[str, Any]) -> None:
     """Stash a planned work order so the issuer can recover it across the HITL
-    approval gap (upstream payload is dropped after a human gate)."""
+    approval gap (upstream payload is dropped after a human step)."""
     if not work_order_id:
         return
     with _LOCK:

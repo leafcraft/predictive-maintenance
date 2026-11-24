@@ -41,10 +41,10 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
   (RUL + safety floors), `work_order_scheduler_agent` (plan + parts gate + priority),
   `spare_parts_forecaster_agent`, `equipment_lifecycle_agent`,
   `safety_incident_reporter_agent`, `maintenance_records_agent`.
-- **Finisher** — `work_order_issuer_agent` (behind the human gate: auth re-check →
+- **Finisher** — `work_order_issuer_agent` (behind the human step: auth re-check →
   invariants → render pack → delete-on-block → dispatch → ledger).
 - **Human members** — reliability engineer (on call, 1h), technician (8h shift),
-  ops manager (4h); first-class, Inbox, dual. Nothing is issued on silence.
+  ops manager (4h); first-class, Inbox, `chain` with a reply reader. Nothing is issued on silence.
 - **Supervisor** — the LeafMesh Manager (static routing; escalates non-retryable
   errors, 3 failed agents in one case, or exhausted restarts to the ops manager).
 - **WORM sink** — `maint_audit_logger_agent` (hash-chained, terminal on every branch).
@@ -76,10 +76,10 @@ downtime, fewer emergency parts orders, an auditable PM-compliance trail.
  shutdown_request / engineer_reply ─▶ reliability_engineer_human
 ```
 
-No dual→dual human wires. A request nobody answers is not escalated: its Inbox
-card closes and the ticket records that no reply came (the seats'
-`fallback_response` — `held_for_review` → audit — is declared, and leafmesh
-2.4.486 does not route it for dual seats yet). Every terminal branch lands in
+No person seat calls another person seat. A request nobody answers is not
+escalated: the seat's `fallback_response` (`verdict: hold`,
+`held_for_review`) goes through its routes like any reply and lands in audit.
+Every terminal branch lands in
 `maint_audit_logger_agent`.
 
 ## Modern capabilities (SDK 2.4.131)
@@ -110,9 +110,9 @@ card closes and the ticket records that no reply came (the seats'
 | `failure_predictor_agent` | Predictive reliability analyst | llm + super_agent + module (@chain floors) |
 | `work_order_scheduler_agent` | Maintenance planner | programmatic + module (@pre_compose / @chain) |
 | `work_order_issuer_agent` | Work-order issuer (finisher) | programmatic + module (@chain issuance floor) |
-| `reliability_engineer_human` | Reliability engineer | human (webhook/dual) |
-| `technician_human` | Maintenance technician | human (webhook/dual) |
-| `ops_manager_human` | Operations manager | human (webhook/dual) |
+| `reliability_engineer_human` | Reliability engineer | human (chain + reply reader) |
+| `technician_human` | Maintenance technician | human (chain + reply reader) |
+| `ops_manager_human` | Operations manager | human (chain + reply reader) |
 | `maint_audit_logger_agent` | Compliance records custodian | external/custom |
 | `spare_parts_forecaster_agent` | Spare-parts demand planner | llm + module (cron + tz) |
 | `maintenance_records_agent` | Maintenance records analyst | programmatic (MCP connector) |
@@ -173,10 +173,13 @@ card closes and the ticket records that no reply came (the seats'
   `@chain enforce_severity_floor` maps outcome → mandated severity/route. → ops_manager.
 - **`maintenance_records_agent`** — programmatic; vault connection `cmms_mcp`, tool
   `get_maintenance_history`, mode-dispatched. Inert until that connection exists. → engineer / ops_manager.
-- **Humans** — Studio Inbox, dual. Engineer: approved → issuer; rejected /
-  held_for_review → audit. Technician: parts_issue → planner; completed /
-  held_for_review → audit. Ops manager: every answer → audit. A timeout closes
-  the card and records that no reply came; nothing routes on silence.
+- **Humans** — Studio Inbox, `chain` with a `reply_reader` (`gpt-4o-mini`)
+  that turns the typed reply into a `verdict`. Engineer: approve → issuer;
+  reject / hold → audit. Technician: parts_issue → planner; completed /
+  hold → audit. Ops manager: every reply → audit. On any seat, `answer` goes
+  back to only the agent that asked. On timeout the default `hold` goes
+  through the routes like any reply and lands in audit; nothing is issued on
+  silence.
 - **`maint_audit_logger_agent`** — external/custom, registered via
   `sdk.intelligence("maint_audit_logger_agent")` in `main.py`; hash-chained WORM.
 
@@ -198,7 +201,7 @@ card closes and the ticket records that no reply came (the seats'
 - Lifecycle decision floor + OSHA statutory windows (Python, not LLM).
 - Traceability (scheduler): refuses an untraceable work order.
 - Bounded re-work back-edge (technician `parts_issue` → planner, counter → engineer).
-- Human gates: nothing issued on silence; every answer value has a route.
+- Human steps: nothing issued on silence; every answer value has a route.
 - WORM audit: hash-chained, terminal on every branch.
 
 ## Dev store (day-0, no connectors)
@@ -229,7 +232,7 @@ floors + finisher with `python -m pytest`.
 ## Reflection / decisions
 
 - **Coordinator + finisher added** to make this a pod, not a pipeline: Mira owns
-  the case; Ivan actuates behind the human gate (auth re-check, render, delete-on-
+  the case; Ivan actuates behind the human step (auth re-check, render, delete-on-
   block) — the planner no longer dispatches (reader ≠ assembler ≠ actuator).
 - **Playbook replaced the mongo `knowledge:` blocks** — the craft is loaded on
   demand (per-agent registry requires ≥2.4.130), keeping the template core-only.
@@ -237,5 +240,5 @@ floors + finisher with `python -m pytest`.
   fire on post-floor values (belt-and-braces).
 - **State stays in the customer's systems** via connectors; the dev store + WORM
   file are dev stand-ins, never systems of record.
-- **No dual→dual human edges** — the SDK warns on them. Silence on a gate is not
-  escalated to the next tier on leafmesh 2.4.486 (see the README).
+- **No human→human edges** — escalation goes through the coordinator or the
+  Manager. Silence on a gate is not escalated to the next tier (see the README).

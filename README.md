@@ -47,8 +47,8 @@ deterministic risk score, forces the safety route in code, not in a prompt.
 **Wanda refuses to issue into a parts gap** and refuses to mint an untraceable
 work order. **Ivan re-checks that a human actually authorised** before it issues
 anything, and **deletes a half-issued pack** if its floor trips. **Silence never
-advances a work order**: if nobody answers a request in time, its Inbox card
-closes and the ticket records that no reply came. Nothing is issued on silence.
+advances a work order**: if nobody answers a request in time, the seat's
+default reply, `hold`, is recorded in the audit log. Nothing is issued on silence.
 A healthy asset (remaining life beyond the 30-day planning horizon, not
 safety-critical) gets no work order; its score is recorded in the audit trail.
 Routine work (planned/corrective with parts on hand) auto-issues and dispatches;
@@ -88,7 +88,7 @@ store.py`); condition reads, the IIoT stream, and CMMS use dev stand-ins that
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `LEAFMESH_ENV_TOKEN` | Per-environment telemetry | **Required.** |
 | `OPENAI_API_KEY` | Every LLM agent (`gpt-4o-mini`) | **Required.** |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |
@@ -120,14 +120,14 @@ queues → MQTT for the `plant_iiot` broker) — the SDK refuses a `url:` / `tok
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `mira_coordinator_agent` | Maintenance Coordinator | Owns the case end to end; opens it, keeps live status, is the reliability team's one contact | LLM; orchestrates Rex→Wanda→Ivan; routes exceptions to the engineer; **never reads a sensor or approves** |
+| `mira_coordinator_agent` | Maintenance Coordinator | Owns the case end to end; opens it, keeps live status, is the reliability team's one contact | LLM + **playbook** (`open_case` / `status` / `escalate`); orchestrates Rex→Wanda→Ivan; routes exceptions to the engineer; **never reads a sensor or approves** |
 | `condition_sensor_agent` | Condition-Monitoring Engineer | Reads vibration/temp/current per asset, flags anomalies | Programmatic + **scaling.copies** (atomic-claim fleet fan-out) + **listen_events** (IIoT) + dev-store tools; on anomaly → Rex |
 | `failure_predictor_agent` | Predictive Reliability Analyst | Scores RUL, failure mode, confidence; writes the engineer briefing | LLM + **super_agent** + **playbook** + telemetry tools; `@chain` **safety floors** (fail closed); → Wanda / engineer |
 | `work_order_scheduler_agent` | Maintenance Planner | Picks window + work type, runs the parts gate, sets priority; bounds re-work | Programmatic; `@pre_compose` parts + `@chain` priority floor; → issuer (routine) / engineer (review/gap) |
 | `work_order_issuer_agent` | Work-Order Issuer | Issues the approved pack, dispatches the technician, records the ledger | Programmatic **finisher**; auth re-check → invariants → render pack → **delete-on-block** → dispatch |
-| `reliability_engineer_human` | Reliability engineer, on call (Human) | Reviews shutdown / parts-gap decisions; approves, rejects or holds | Human gate, **1h** (P1 on-call response) — approved → issuer; rejected / held_for_review → audit |
-| `technician_human` | Maintenance technician (Human) | Does the repair; reports completed / parts_issue | Human gate, **8h** (one shift) — parts_issue → planner (bounded); completed / held_for_review → audit |
-| `ops_manager_human` | Operations manager (Human) | Production-impact tier: capex sign-off, safety-incident escalations, critical parts shortages, PM-compliance misses | Human gate, **4h** (leaves time inside OSHA's 8h fatality window) — every answer → audit |
+| `reliability_engineer_human` | Reliability engineer, on call (Human) | Reviews shutdown / parts-gap decisions; approves, rejects or holds | Human step, **1h** (P1 on-call response) — verdict `approve` → issuer; `reject` / `hold` → audit |
+| `technician_human` | Maintenance technician (Human) | Does the repair; reports completed / parts_issue | Human step, **8h** (one shift) — verdict `parts_issue` → planner (bounded); `completed` / `hold` → audit |
+| `ops_manager_human` | Operations manager (Human) | Production-impact tier: capex sign-off, safety-incident escalations, critical parts shortages, PM-compliance misses | Human step, **4h** (leaves time inside OSHA's 8h fatality window) — every reply → audit (`answer` goes back to the agent that asked) |
 | `maint_audit_logger_agent` | Compliance records custodian | Hash-chains every issue, dispatch, approval, hold, and forecast | External (custom sink); terminus |
 | `spare_parts_forecaster_agent` | Spare-Parts Demand Planner | 30/60/90-day parts forecast; critical shortages + overstock | LLM + **playbook**, weekly cron + **timezone**; `@chain` stockout floor; → ops manager |
 | `maintenance_records_agent` | Maintenance Records Analyst | WO ledger/MTBF, PM-compliance, recurrence sweep (CMMS) | Programmatic + MCP connector; → engineer / ops manager |
@@ -139,12 +139,18 @@ team. It escalates to the Ops Manager on a non-retryable error (auth, a bad
 request, credit, bad config), when 3 different agents fail in one case, or when
 restarts run out. A malformed hand-off only raises an alert.
 
+**How a person replies.** The Inbox has no buttons. The person types a reply,
+and a small reply reader (`gpt-4o-mini`) turns it into one of the seat's
+verdicts in the table above. Anything that is not a clear decision — no, not
+now, wait — reads as `hold`. If the person answered an agent's question instead
+of deciding, the verdict is `answer` and it goes back to only the agent that
+asked.
+
 **If nobody answers.** Each human request waits for the time in the table above.
-If nobody answers within it, the request waits no longer: its Inbox card closes
-and the ticket records that no reply came. Nothing is issued, dispatched or
-approved on silence, and nobody is chased automatically. (Each seat's
-`fallback_response` — `held_for_review` → audit — states the intended
-default-deny; leafmesh 2.4.486 does not route it for these seats yet.)
+If nobody answers within it, the seat's default reply (`fallback_response`:
+`verdict: hold`, `held_for_review`) goes through its routes like any reply and
+is recorded in the audit log. Nothing is issued, dispatched or approved on
+silence, and nobody is chased automatically.
 
 ## The deterministic floors (LLM-unwaivable)
 

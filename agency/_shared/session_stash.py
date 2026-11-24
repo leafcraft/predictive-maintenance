@@ -50,7 +50,7 @@ def peek(session_id: str, key: str, default: int = 0) -> int:
 def resolve_session_id(input_data: Any, context: Any) -> str:
     """Find the session id wherever the SDK delivered it — needed by the
     finisher/planner to key the bounded-loop counter and the HITL stash across
-    the human gate (the SDK resumes a chain with only the human-reply fields)."""
+    the human step (the SDK resumes a chain with only the human-reply fields)."""
     for src in (input_data, context):
         if not isinstance(src, dict):
             continue
